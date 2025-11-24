@@ -1,0 +1,12 @@
+yt-dlp>=2025.11.0
+pydub>=0.25.1
+openai>=1.0.0
+pyttsx3>=2.90
+ffmpeg-python>=0.3.0
+# Optional: better offline ASR
+whisper>=20230722
+
+# Azure Speech SDK (Speech-to-Text and Text-to-Speech)
+azure-cognitiveservices-speech>=1.23.0
+requests>=2.31.0
+azure-storage-blob>=12.17.0
