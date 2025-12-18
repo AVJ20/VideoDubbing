@@ -1,0 +1,19 @@
+# ASR Requirements - MINIMAL PIN STRATEGY
+# Install with: pip install -r requirements-asr.txt
+
+# Core ASR (Transcription + Speaker Diarization)
+# ============================================
+# Top-level packages only. Let pip auto-resolve transitive dependencies.
+openai-whisper==20231117      # Whisper speech-to-text
+pyannote.audio==2.1.1         # Speaker diarization
+torch==1.13.1                 # PyTorch (1.13.1 has broad compatibility)
+torchaudio==0.13.1            # Audio processing for torch
+numpy==1.24.4                 # Compatible with numba 0.57.1 (requires <1.25)
+numba==0.57.1                 # Required by whisper timing
+
+# Optional: HuggingFace utilities
+huggingface-hub>=0.10.0       # For model downloads
+transformers>=4.20.0          # For future NLP tasks
+
+# Security & utilities
+certifi>=2024.0.0             # SSL certificates

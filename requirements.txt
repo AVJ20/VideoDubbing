@@ -1,12 +1,24 @@
 yt-dlp>=2025.11.0
 pydub>=0.25.1
-openai>=1.0.0
-pyttsx3>=2.90
 ffmpeg-python>=0.3.0
-# Optional: better offline ASR
-whisper>=20230722
-
-# Azure Speech SDK (Speech-to-Text and Text-to-Speech)
-azure-cognitiveservices-speech>=1.23.0
 requests>=2.31.0
+
+# Translation backends - choose at least one
+openai>=1.0.0           # Paid option
+groq>=0.4.0             # Free option (recommended)
+ollama>=0.1.0           # Free local option
+
+# Text-to-Speech backends - choose at least one
+pyttsx3>=2.90                           # Local TTS (no internet needed)
+azure-cognitiveservices-speech>=1.23.0  # Azure TTS (400+ voices, emotions)
+TTS==0.22.0                             # Coqui TTS (compatible with torch 1.13.1)
+elevenlabs>=0.2.0                       # ElevenLabs TTS (highest quality)
+google-cloud-texttospeech>=2.14.0       # Google Cloud TTS (400+ voices)
 azure-storage-blob>=12.17.0
+
+# Speech Recognition (ASR) - Recommended free option with speaker diarization
+openai-whisper>=20231117      # Whisper speech-to-text
+pyannote.audio>=2.1.0         # Speaker diarization
+torch>=2.0.0                  # PyTorch ML framework
+torchaudio>=2.0.0             # Audio processing
+huggingface-hub>=0.16.0       # HuggingFace model management

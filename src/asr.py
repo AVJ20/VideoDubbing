@@ -14,7 +14,7 @@ class ASRResult:
 
 class AbstractASR(ABC):
     @abstractmethod
-    def transcribe(self, audio_path: str) -> ASRResult:
+    def transcribe(self, audio_path: str, language: str = "en") -> ASRResult:
         pass
 
 
@@ -33,12 +33,171 @@ class WhisperASR(AbstractASR):
         self.model_name = model
         self.model = whisper.load_model(model)
 
-    def transcribe(self, audio_path: str) -> ASRResult:
-        logger.info("Transcribing with whisper: %s", audio_path)
-        result = self.model.transcribe(audio_path)
+    def transcribe(self, audio_path: str, language: str = "en") -> ASRResult:
+        logger.info("Transcribing with whisper: %s (language: %s)", audio_path, language)
+        result = self.model.transcribe(audio_path, language=language)
         text = result.get("text", "")
         segments = result.get("segments") or []
         return ASRResult(text=text, segments=segments)
+
+
+class WhisperWithDiarizationASR(AbstractASR):
+    """Uses Whisper for transcription + Pyannote for speaker diarization.
+
+    Combines two state-of-the-art open-source models:
+    - OpenAI Whisper: Multilingual speech-to-text (trained on 680K hours)
+    - Pyannote Audio: Speaker diarization (identifies who is speaking when)
+
+    Result includes segment-level timestamps, text, and speaker identification.
+    This is the recommended FREE ASR for multi-speaker video dubbing.
+
+    Requirements:
+    - pip install openai-whisper pyannote.audio torch torchaudio
+    - First run downloads ~400MB models; subsequent runs are fast.
+    """
+
+    def __init__(self, whisper_model: str = "small", device: str = "cpu"):
+        """
+        Args:
+            whisper_model: Whisper model size ('tiny', 'base', 'small', 'medium', 'large')
+            device: 'cpu' or 'cuda' for GPU acceleration
+        """
+        try:
+            import whisper
+        except ImportError:
+            raise RuntimeError(
+                "whisper is not installed. Install with: pip install openai-whisper"
+            )
+
+        try:
+            from pyannote.audio import Pipeline
+        except ImportError:
+            raise RuntimeError(
+                "pyannote.audio is not installed. Install with: pip install pyannote.audio"
+            )
+
+        try:
+            import torch
+        except ImportError:
+            raise RuntimeError(
+                "torch is not installed. Install with: pip install torch torchaudio"
+            )
+
+        self.whisper = whisper
+        self.whisper_model_name = whisper_model
+        self.device = device
+        self.torch = torch
+
+        logger.info("Loading Whisper model: %s (device: %s)", whisper_model, device)
+        self.whisper_model = whisper.load_model(whisper_model, device=device)
+
+        logger.info("Loading Pyannote speaker diarization pipeline...")
+        # Pyannote requires huggingface token acceptance for models
+        # The model will be cached after first download
+        try:
+            self.diarization_pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=True,  # Will use cached token if available
+            )
+            self.diarization_pipeline.to(torch.device(device))
+        except Exception as e:
+            # If auth fails, provide helpful message
+            logger.warning(
+                "Could not load Pyannote model: %s. "
+                "You may need to accept the model license at "
+                "https://huggingface.co/pyannote/speaker-diarization-3.1 "
+                "and authenticate with: huggingface-cli login",
+                str(e),
+            )
+            self.diarization_pipeline = None
+
+    def transcribe(self, audio_path: str, language: str = "en") -> ASRResult:
+        """Transcribe audio with speaker diarization.
+
+        Args:
+            audio_path: Path to audio file
+            language: Language code (e.g. 'en', 'es', 'fr', 'auto' for auto-detect)
+
+        Returns segments with: {text, speaker, offset, duration, confidence, words}
+        """
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        logger.info("Transcribing with Whisper: %s (language: %s)", audio_path, language)
+
+        # Step 1: Whisper transcription (get text + timing)
+        whisper_result = self.whisper_model.transcribe(audio_path, language=language, verbose=False)
+        whisper_segments = whisper_result.get("segments", [])
+
+        logger.info("Whisper found %d segments", len(whisper_segments))
+
+        # Step 2: Speaker diarization (get who speaks when)
+        diarization_segments = []
+        if self.diarization_pipeline:
+            try:
+                logger.info("Running speaker diarization...")
+                diarization = self.diarization_pipeline(audio_path)
+                # diarization is a list of (segment, speaker_label) tuples
+                # segment has .start and .end (in seconds)
+                for turn, speaker in diarization.itertracks(yield_label=True):
+                    diarization_segments.append(
+                        {
+                            "start": turn.start,
+                            "end": turn.end,
+                            "speaker": speaker,
+                        }
+                    )
+                logger.info("Diarization found %d speaker turns", len(diarization_segments))
+            except Exception as e:
+                logger.warning("Diarization failed: %s. Proceeding without speaker info.", str(e))
+                diarization_segments = []
+        else:
+            logger.warning("Diarization pipeline not available. Proceeding without speaker identification.")
+
+        # Step 3: Merge Whisper segments with speaker info
+        merged_segments = []
+        for ws in whisper_segments:
+            # Whisper segment times
+            ws_start = ws.get("start", 0.0)
+            ws_end = ws.get("end", 0.0)
+            ws_text = ws.get("text", "").strip()
+
+            if not ws_text:
+                continue
+
+            # Find overlapping speaker segments
+            speaker = None
+            if diarization_segments:
+                # Find speaker with max overlap with whisper segment
+                max_overlap = 0.0
+                for ds in diarization_segments:
+                    ds_start = ds["start"]
+                    ds_end = ds["end"]
+                    # Compute overlap
+                    overlap_start = max(ws_start, ds_start)
+                    overlap_end = min(ws_end, ds_end)
+                    if overlap_end > overlap_start:
+                        overlap = overlap_end - overlap_start
+                        if overlap > max_overlap:
+                            max_overlap = overlap
+                            speaker = ds["speaker"]
+
+            merged_segments.append(
+                {
+                    "text": ws_text,
+                    "speaker": speaker or "Unknown",
+                    "offset": ws_start,
+                    "duration": ws_end - ws_start,
+                    "confidence": ws.get("confidence", 1.0),
+                    "words": ws.get("words", []),
+                }
+            )
+
+        # Full text is concatenation of all segments
+        full_text = "\n".join([s["text"] for s in merged_segments])
+
+        logger.info("Transcription complete: %d segments, %d characters", len(merged_segments), len(full_text))
+        return ASRResult(text=full_text, segments=merged_segments)
 
 
 class StubASR(AbstractASR):
@@ -47,8 +206,8 @@ class StubASR(AbstractASR):
     Useful when dependencies are missing.
     """
 
-    def transcribe(self, audio_path: str) -> ASRResult:
-        logger.warning("Using StubASR: returning filename as transcript.")
+    def transcribe(self, audio_path: str, language: str = "en") -> ASRResult:
+        logger.warning("Using StubASR: returning filename as transcript (language: %s).", language)
         text = os.path.basename(audio_path)
         return ASRResult(text=text, segments=[])
 
@@ -77,12 +236,14 @@ class AzureSpeechASR(AbstractASR):
 
         self.speech_config = speechsdk.SpeechConfig(subscription=self.key, region=self.region)
 
-    def transcribe(self, audio_path: str) -> ASRResult:
+    def transcribe(self, audio_path: str, language: str = "en") -> ASRResult:
         speechsdk = self.speechsdk
         audio_input = speechsdk.AudioConfig(filename=audio_path)
+        # Set language in speech config
+        self.speech_config.speech_recognition_language = language
         recognizer = speechsdk.SpeechRecognizer(speech_config=self.speech_config, audio_config=audio_input)
 
-        logger.info("AzureSpeechASR: recognizing %s", audio_path)
+        logger.info("AzureSpeechASR: recognizing %s (language: %s)", audio_path, language)
         result = recognizer.recognize_once()
 
         if result.reason == speechsdk.ResultReason.RecognizedSpeech:
@@ -237,10 +398,14 @@ class AzureBatchASR(AbstractASR):
         except Exception:
             return 0.0
 
-    def transcribe(self, audio_paths, locale: str = "en-US", display_name: str | None = None) -> ASRResult:
+    def transcribe(self, audio_paths, language: str = "en", locale: str | None = None, display_name: str | None = None) -> ASRResult:
         # Accept single path or list
         if isinstance(audio_paths, (str,)):
             audio_paths = [audio_paths]
+        
+        # Convert language code to locale if not provided (e.g., 'en' -> 'en-US')
+        if locale is None:
+            locale = f"{language}-US" if language.lower() not in ('zh', 'pt', 'es', 'ru') else language.upper()
 
         content_urls = []
         for p in audio_paths:
