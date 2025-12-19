@@ -34,6 +34,67 @@ class EnvManager:
             return str(python_exe_scripts)
         # If neither exists, return the expected path (for error messages)
         return str(cls.CONDA_BASE / "envs" / env_name / "python.exe")
+
+    @staticmethod
+    def _run_worker_and_parse_json(cmd: list[str]) -> Dict[str, Any]:
+        """Run a worker subprocess and robustly parse its JSON response.
+
+        On Windows, decoding subprocess output using the default console encoding
+        can raise UnicodeDecodeError (e.g., cp1252). Force UTF-8 with
+        `errors='replace'` so we never crash while reading output.
+
+        Workers are expected to print a single JSON object (typically on stdout)
+        even if progress bars or warnings are emitted.
+        """
+
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        stdout = (completed.stdout or "").strip()
+        stderr = (completed.stderr or "").strip()
+
+        def _extract_json(text: str) -> Optional[Dict[str, Any]]:
+            if not text:
+                return None
+            # Prefer the last JSON-looking line.
+            for line in reversed(text.splitlines()):
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        return json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+            # Fallback: whole text is JSON.
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return None
+
+        output_data = _extract_json(stdout) or _extract_json(stderr)
+
+        if completed.returncode != 0:
+            if output_data and output_data.get("status") == "error":
+                raise RuntimeError(str(output_data.get("error") or "Worker reported error"))
+            raise RuntimeError(
+                "Worker process failed. "
+                f"exit_code={completed.returncode}. "
+                f"stdout={stdout[-2000:] if stdout else ''} "
+                f"stderr={stderr[-2000:] if stderr else ''}"
+            )
+
+        if not output_data:
+            raise RuntimeError(
+                "Worker did not return valid JSON. "
+                f"stdout={stdout[-2000:] if stdout else ''} "
+                f"stderr={stderr[-2000:] if stderr else ''}"
+            )
+
+        return output_data
     
     @classmethod
     def run_asr(cls, audio_path: str, language: str = "en") -> Dict[str, Any]:
@@ -67,20 +128,13 @@ class EnvManager:
         cmd = [python_exe, str(worker_script), audio_path, language, output_json]
         
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            
-            # Parse JSON output
-            output_data = json.loads(result.stdout)
+            output_data = cls._run_worker_and_parse_json(cmd)
             
             if output_data.get("status") == "success":
                 logger.info("ASR completed successfully")
                 return output_data
             else:
                 raise RuntimeError(f"ASR failed: {output_data.get('error')}")
-                
-        except subprocess.CalledProcessError as e:
-            logger.error(f"ASR subprocess failed: {e.stderr}")
-            raise RuntimeError(f"ASR worker error: {e.stderr}")
         finally:
             # Clean up temp JSON
             if os.path.exists(output_json):
@@ -116,22 +170,14 @@ class EnvManager:
         if voice:
             voice = str(Path(voice).absolute())
             cmd.extend(["--voice", voice])
-        
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            
-            # Parse JSON output
-            output_data = json.loads(result.stdout)
-            
-            if output_data.get("status") == "success":
-                logger.info("TTS completed successfully")
-                return output_data
-            else:
-                raise RuntimeError(f"TTS failed: {output_data.get('error')}")
-                
-        except subprocess.CalledProcessError as e:
-            logger.error(f"TTS subprocess failed: {e.stderr}")
-            raise RuntimeError(f"TTS worker error: {e.stderr}")
+
+        output_data = cls._run_worker_and_parse_json(cmd)
+
+        if output_data.get("status") == "success":
+            logger.info("TTS completed successfully")
+            return output_data
+        else:
+            raise RuntimeError(f"TTS failed: {output_data.get('error')}")
     
     @classmethod
     def check_envs(cls) -> Dict[str, bool]:

@@ -7,6 +7,94 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+
+def _allow_anonymous_hf_downloads_if_needed(hf_token: str | None = None) -> None:
+    """Coerce `token=True` Hugging Face downloads to anonymous.
+
+    Some downstream libraries (or specific versions) call into `huggingface_hub`
+    with `token=True` unconditionally. In modern `huggingface_hub`, that raises
+    `LocalTokenNotFoundError` when the user isn't logged in, even for public
+    repos. Since download helpers are decorated at import-time, we wrap the
+    download entry points directly.
+
+    If the target repo is gated/private, anonymous download will still fail with
+    401/403 and the user must authenticate.
+    """
+
+    try:
+        try:
+            import huggingface_hub.utils._headers as headers
+
+            orig_get = getattr(headers, "get_token_to_send", None)
+            if orig_get is not None and not getattr(orig_get, "__vd_token_true_patch__", False):
+
+                def patched_get_token_to_send(token):
+                    if token is True:
+                        token = hf_token if hf_token else False
+                    return orig_get(token)
+
+                patched_get_token_to_send.__vd_token_true_patch__ = True
+                headers.get_token_to_send = patched_get_token_to_send
+        except Exception:
+            pass
+
+        import inspect
+        import huggingface_hub
+
+        def _wrap(module, attr: str) -> None:
+            fn = getattr(module, attr, None)
+            if fn is None:
+                return
+            if getattr(fn, "__vd_token_true_patch__", False):
+                return
+
+            sig = None
+            try:
+                sig = inspect.signature(fn)
+            except Exception:
+                sig = None
+
+            def wrapped(*args, **kwargs):
+                if sig is not None:
+                    try:
+                        bound = sig.bind_partial(*args, **kwargs)
+                        if bound.arguments.get("token") is True:
+                            bound.arguments["token"] = hf_token if hf_token else False
+                        if bound.arguments.get("use_auth_token") is True:
+                            bound.arguments["use_auth_token"] = hf_token if hf_token else False
+                        return fn(*bound.args, **bound.kwargs)
+                    except Exception:
+                        pass
+
+                if kwargs.get("token") is True:
+                    kwargs["token"] = hf_token if hf_token else False
+                if kwargs.get("use_auth_token") is True:
+                    kwargs["use_auth_token"] = hf_token if hf_token else False
+                return fn(*args, **kwargs)
+
+            wrapped.__vd_token_true_patch__ = True
+            setattr(module, attr, wrapped)
+
+        _wrap(huggingface_hub, "hf_hub_download")
+        _wrap(huggingface_hub, "snapshot_download")
+
+        try:
+            import huggingface_hub.file_download as file_download
+
+            _wrap(file_download, "hf_hub_download")
+        except Exception:
+            pass
+
+        try:
+            import huggingface_hub._snapshot_download as snapshot_mod
+
+            _wrap(snapshot_mod, "snapshot_download")
+        except Exception:
+            pass
+
+    except Exception:
+        return
+
 try:
     import pyttsx3
 except Exception:  # pragma: no cover - optional dependency
@@ -286,6 +374,139 @@ class GoogleCloudTTS(AbstractTTS):
 
         logger.info("GoogleCloudTTS synthesis complete: %s", out_path)
         return out_path
+
+
+class ChatterboxTTS(AbstractTTS):
+    """Chatterbox TTS - Local, open-source text-to-speech with voice cloning.
+    
+    Features:
+    - Local model (no API calls needed)
+    - Voice cloning support (requires reference audio)
+    - High-quality synthesis
+    - Open-source and free
+    - Supports GPU acceleration (CUDA)
+    - Multilingual support
+    
+    Installation: pip install chatterbox-tts torch torchaudio
+    """
+
+    def __init__(self, device: str = "cpu"):
+        """
+        Args:
+            device: 'cpu' or 'cuda' for GPU acceleration
+        """
+        try:
+            from chatterbox.tts_turbo import ChatterboxTurboTTS
+            import chatterbox.tts_turbo as tts_turbo_mod
+            import torchaudio as ta
+        except ImportError:
+            raise RuntimeError(
+                "Chatterbox TTS is not installed. Install with: pip install chatterbox-tts torch torchaudio"
+            )
+        
+        self.ChatterboxTurboTTS = ChatterboxTurboTTS
+        self.ta = ta
+        self.device = device
+        
+        logger.info(f"Loading ChatterboxTurboTTS model (device: {device})")
+        try:
+            hf_token = (
+                os.environ.get("HF_TOKEN")
+                or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
+                or os.environ.get("HUGGINGFACE_TOKEN")
+            )
+
+            # Apply the workaround early so it also covers chatterbox versions
+            # that ignore token=False and force token=True internally.
+            _allow_anonymous_hf_downloads_if_needed(hf_token)
+
+            # Some chatterbox versions import `snapshot_download` into their module
+            # namespace and call it directly. Patch that symbol too.
+            try:
+                import inspect
+
+                orig_snapshot = getattr(tts_turbo_mod, "snapshot_download", None)
+                if orig_snapshot is not None and not getattr(orig_snapshot, "__vd_token_true_patch__", False):
+                    sig = None
+                    try:
+                        sig = inspect.signature(orig_snapshot)
+                    except Exception:
+                        sig = None
+
+                    def snapshot_no_token(*args, **kwargs):
+                        if sig is not None:
+                            try:
+                                bound = sig.bind_partial(*args, **kwargs)
+                                if bound.arguments.get("token") is True:
+                                    bound.arguments["token"] = hf_token if hf_token else False
+                                return orig_snapshot(*bound.args, **bound.kwargs)
+                            except Exception:
+                                pass
+
+                        if kwargs.get("token") is True:
+                            kwargs["token"] = hf_token if hf_token else False
+                        return orig_snapshot(*args, **kwargs)
+
+                    snapshot_no_token.__vd_token_true_patch__ = True
+                    tts_turbo_mod.snapshot_download = snapshot_no_token
+            except Exception:
+                pass
+
+            # Some chatterbox-tts builds call into huggingface_hub with token=True by default,
+            # which raises LocalTokenNotFoundError when you're not logged in.
+            # We prefer:
+            # - use an explicit token if provided
+            # - otherwise avoid requiring a token (token=False)
+            try:
+                # Prefer hf_kwargs if supported (newer chatterbox-tts).
+                self.model = ChatterboxTurboTTS.from_pretrained(
+                    device=device,
+                    hf_kwargs={"token": hf_token if hf_token else False},
+                )
+            except TypeError:
+                # Back-compat: older chatterbox-tts may not accept token=...
+                self.model = ChatterboxTurboTTS.from_pretrained(device=device)
+            self.sr = self.model.sr  # Sample rate
+            logger.info(f"ChatterboxTurboTTS loaded successfully (sample rate: {self.sr})")
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to load ChatterboxTurboTTS. "
+                "If this is a Hugging Face token error, either run `hf auth login` "
+                "or set `HF_TOKEN` / `HUGGINGFACEHUB_API_TOKEN` in the environment. "
+                f"Original error: {e}"
+            )
+
+    def synthesize(self, text: str, out_path: str, voice: Optional[str] = None, language: Optional[str] = None) -> str:
+        """Synthesize text to speech using Chatterbox Turbo.
+        
+        Args:
+            text: Text to synthesize
+            out_path: Output audio file path
+            voice: Path to reference audio clip for voice cloning (10s recommended)
+            language: Language code (not used by Chatterbox, but kept for compatibility)
+        """
+        try:
+            logger.info("ChatterboxTTS: synthesizing to %s", out_path)
+            
+            os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+            
+            # Generate audio with voice cloning if reference provided
+            if voice and os.path.exists(voice):
+                logger.info(f"Synthesizing with voice cloning from: {voice}")
+                wav = self.model.generate(text, audio_prompt_path=voice)
+            else:
+                # Standard synthesis without voice cloning
+                logger.info("Synthesizing with default voice")
+                wav = self.model.generate(text)
+            
+            # Save audio file
+            self.ta.save(out_path, wav, self.sr)
+            logger.info("ChatterboxTTS synthesis complete: %s", out_path)
+            return out_path
+        
+        except Exception as e:
+            logger.error(f"ChatterboxTTS synthesis failed: {e}")
+            raise RuntimeError(f"ChatterboxTTS failed: {e}")
 
 
 class PyttartoTTS(AbstractTTS):

@@ -1,7 +1,8 @@
 import os
 import logging
+import re
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, Sequence, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -14,8 +15,134 @@ except Exception:  # pragma: no cover - optional dependency
 
 class AbstractTranslator(ABC):
     @abstractmethod
-    def translate(self, text: str, source_language: str, target_language: str) -> str:
+    def translate(
+        self,
+        text: str,
+        source_language: str,
+        target_language: str,
+    ) -> str:
         pass
+
+    def translate_with_context(
+        self,
+        text: str,
+        source_language: str,
+        target_language: str,
+        previous_segments: Optional[Sequence[str]] = None,
+        next_segments: Optional[Sequence[str]] = None,
+        register_hint: Optional[str] = None,
+    ) -> str:
+        """Translate a segment using surrounding context.
+
+        Default implementation falls back to `translate` for translators that
+        don't support context.
+        """
+
+        _ = previous_segments, next_segments, register_hint
+        return self.translate(text, source_language, target_language)
+
+
+def infer_register_from_asr(
+    text: str,
+) -> Literal["colloquial", "formal", "neutral"]:
+    """Heuristic register detector based on ASR text.
+
+    This is intentionally simple and language-agnostic-ish: it's used only to
+    nudge the LLM to keep the same register in translation.
+    """
+
+    if not text:
+        return "neutral"
+
+    t = text.strip().lower()
+
+    colloquial_markers = [
+        "gonna",
+        "wanna",
+        "gotta",
+        "ain't",
+        "kinda",
+        "sorta",
+        "lemme",
+        "dunno",
+        "yeah",
+        "yep",
+        "nah",
+        "lol",
+    ]
+    formal_markers = [
+        "therefore",
+        "however",
+        "moreover",
+        "furthermore",
+        "regarding",
+        "sincerely",
+        "respectfully",
+        "please",
+    ]
+
+    colloquial_score = sum(1 for m in colloquial_markers if m in t)
+    formal_score = sum(1 for m in formal_markers if m in t)
+
+    # Punctuation and contraction hints.
+    contraction_pattern = (
+        r"\b(i'm|you're|we're|they're|"
+        r"can't|won't|don't|doesn't|isn't|aren't)\b"
+    )
+    if re.search(contraction_pattern, t):
+        colloquial_score += 1
+    if any(ch in t for ch in ["!!!", "?!", "..", "..."]):
+        colloquial_score += 1
+
+    if formal_score > colloquial_score and formal_score >= 2:
+        return "formal"
+    if colloquial_score > formal_score and colloquial_score >= 2:
+        return "colloquial"
+    return "neutral"
+
+
+def build_context_aware_translation_prompt(
+    *,
+    source_language: str,
+    target_language: str,
+    current_text: str,
+    previous_segments: Sequence[str],
+    next_segments: Sequence[str],
+    register: Literal["colloquial", "formal", "neutral"],
+) -> str:
+    prev_block = (
+        "\n".join(f"- {t}" for t in previous_segments)
+        if previous_segments
+        else "(none)"
+    )
+    next_block = (
+        "\n".join(f"- {t}" for t in next_segments)
+        if next_segments
+        else "(none)"
+    )
+
+    register_instruction = {
+        "colloquial": "Keep it colloquial and natural, like casual speech.",
+        "formal": "Keep it formal and polite.",
+        "neutral": "Keep it natural and neutral (not too formal or slangy).",
+    }[register]
+
+    return (
+        "You are a professional audiovisual translator.\n"
+        f"Translate ONLY the CURRENT segment from {source_language} "
+        f"to {target_language}.\n"
+        "Use surrounding context ONLY to resolve meaning and references.\n"
+        "Do NOT translate context lines; translate only the CURRENT segment.\n"
+        "Preserve meaning, punctuation, numbers, and named entities.\n"
+        f"Register guidance: {register_instruction}\n\n"
+        "PREVIOUS (up to 5 segments):\n"
+        f"{prev_block}\n\n"
+        "CURRENT (translate this):\n"
+        f"{current_text}\n\n"
+        "NEXT (up to 5 segments):\n"
+        f"{next_block}\n\n"
+        "Output only the translated CURRENT segment text."
+    )
 
 
 class OpenAITranslator(AbstractTranslator):
@@ -79,6 +206,39 @@ class OpenAITranslator(AbstractTranslator):
         except Exception as e:
             logger.error("OpenAI translation failed: %s", str(e))
             raise
+
+    def translate_with_context(
+        self,
+        text: str,
+        source_language: str,
+        target_language: str,
+        previous_segments: Optional[Sequence[str]] = None,
+        next_segments: Optional[Sequence[str]] = None,
+        register_hint: Optional[str] = None,
+    ) -> str:
+        register = infer_register_from_asr(text)
+        if register_hint in {"colloquial", "formal", "neutral"}:
+            register = register_hint  # type: ignore[assignment]
+
+        prompt = build_context_aware_translation_prompt(
+            source_language=source_language,
+            target_language=target_language,
+            current_text=text,
+            previous_segments=list(previous_segments or []),
+            next_segments=list(next_segments or []),
+            register=register,
+        )
+
+        logger.info(
+            "Sending context-aware translation request to OpenAI model %s",
+            self.model,
+        )
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2000,
+        )
+        return resp.choices[0].message.content.strip()
 
 
 class AzureOpenAITranslator(AbstractTranslator):
@@ -170,16 +330,39 @@ class AzureOpenAITranslator(AbstractTranslator):
         except Exception as e:
             logger.error("Azure OpenAI translation failed: %s", str(e))
             raise
-    def translate(
+
+    def translate_with_context(
         self,
         text: str,
         source_language: str,
         target_language: str,
+        previous_segments: Optional[Sequence[str]] = None,
+        next_segments: Optional[Sequence[str]] = None,
+        register_hint: Optional[str] = None,
     ) -> str:
-        logger.warning(
-            "Using IdentityTranslator: returning original text"
+        register = infer_register_from_asr(text)
+        if register_hint in {"colloquial", "formal", "neutral"}:
+            register = register_hint  # type: ignore[assignment]
+
+        prompt = build_context_aware_translation_prompt(
+            source_language=source_language,
+            target_language=target_language,
+            current_text=text,
+            previous_segments=list(previous_segments or []),
+            next_segments=list(next_segments or []),
+            register=register,
         )
-        return text
+
+        logger.info(
+            "Sending context-aware translation to Azure OpenAI deployment %s",
+            self.deployment_name,
+        )
+        resp = self.client.chat.completions.create(
+            model=self.deployment_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2000,
+        )
+        return resp.choices[0].message.content.strip()
 
 
 class GroqTranslator(AbstractTranslator):
@@ -239,6 +422,39 @@ class GroqTranslator(AbstractTranslator):
             logger.error("Groq translation failed: %s", str(e))
             raise
 
+    def translate_with_context(
+        self,
+        text: str,
+        source_language: str,
+        target_language: str,
+        previous_segments: Optional[Sequence[str]] = None,
+        next_segments: Optional[Sequence[str]] = None,
+        register_hint: Optional[str] = None,
+    ) -> str:
+        register = infer_register_from_asr(text)
+        if register_hint in {"colloquial", "formal", "neutral"}:
+            register = register_hint  # type: ignore[assignment]
+
+        prompt = build_context_aware_translation_prompt(
+            source_language=source_language,
+            target_language=target_language,
+            current_text=text,
+            previous_segments=list(previous_segments or []),
+            next_segments=list(next_segments or []),
+            register=register,
+        )
+
+        logger.info(
+            "Sending context-aware translation to Groq model %s",
+            self.model,
+        )
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2000,
+        )
+        return resp.choices[0].message.content.strip()
+
 
 class OllamaTranslator(AbstractTranslator):
     """Local translation using Ollama (completely free, runs offline).
@@ -297,3 +513,36 @@ class OllamaTranslator(AbstractTranslator):
         except Exception as e:
             logger.error("Ollama translation failed: %s", str(e))
             raise
+
+    def translate_with_context(
+        self,
+        text: str,
+        source_language: str,
+        target_language: str,
+        previous_segments: Optional[Sequence[str]] = None,
+        next_segments: Optional[Sequence[str]] = None,
+        register_hint: Optional[str] = None,
+    ) -> str:
+        register = infer_register_from_asr(text)
+        if register_hint in {"colloquial", "formal", "neutral"}:
+            register = register_hint  # type: ignore[assignment]
+
+        prompt = build_context_aware_translation_prompt(
+            source_language=source_language,
+            target_language=target_language,
+            current_text=text,
+            previous_segments=list(previous_segments or []),
+            next_segments=list(next_segments or []),
+            register=register,
+        )
+
+        logger.info(
+            "Sending context-aware translation to Ollama model %s",
+            self.model,
+        )
+        resp = self.client.generate(
+            model=self.model,
+            prompt=prompt,
+            stream=False,
+        )
+        return resp.get("response", "").strip()

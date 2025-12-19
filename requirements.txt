@@ -11,7 +11,7 @@ ollama>=0.1.0           # Free local option
 # Text-to-Speech backends - choose at least one
 pyttsx3>=2.90                           # Local TTS (no internet needed)
 azure-cognitiveservices-speech>=1.23.0  # Azure TTS (400+ voices, emotions)
-TTS==0.22.0                             # Coqui TTS (compatible with torch 1.13.1)
+chatterbox-tts>=0.0.1                   # Chatterbox TTS (open-source, voice cloning)
 elevenlabs>=0.2.0                       # ElevenLabs TTS (highest quality)
 google-cloud-texttospeech>=2.14.0       # Google Cloud TTS (400+ voices)
 azure-storage-blob>=12.17.0
