@@ -1,0 +1,25 @@
+# TTS Requirements (separate 'tts' conda env)
+# Install with: pip install -r requirements-tts.txt
+#
+# Notes:
+# - This env is meant to run workers/tts_worker.py (Chatterbox voice cloning).
+# - For GPU/CUDA installs, you may need to install torch/torchaudio from the
+#   official PyTorch index URL for your CUDA version.
+
+# Core TTS
+chatterbox-tts>=0.0.1
+
+# ML runtime
+torch>=2.0.0
+torchaudio>=2.0.0
+numpy<2
+
+# Model download utils
+huggingface-hub>=0.16.0
+safetensors>=0.4.0
+
+# Audio I/O helpers (commonly needed on Windows)
+soundfile>=0.12.1
+
+# Optional fallback TTS (no internet, useful for debugging)
+pyttsx3>=2.90
