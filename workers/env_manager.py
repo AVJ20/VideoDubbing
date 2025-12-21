@@ -9,6 +9,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Optional, Dict, Any
+import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +179,86 @@ class EnvManager:
             return output_data
         else:
             raise RuntimeError(f"TTS failed: {output_data.get('error')}")
+
+    @classmethod
+    def run_tts_batch(
+        cls,
+        tasks: list[dict],
+        *,
+        device: str = "cpu",
+        tts_backend: str = "chatterbox",
+    ) -> Dict[str, Any]:
+        """Run TTS for multiple tasks in a single worker invocation.
+
+        Each task should contain:
+        - segment_id (int)
+        - text (str)
+        - language (str)
+        - output_audio (str)
+        - voice (optional path)
+        - speaker_id (optional)
+        """
+
+        if not tasks:
+            return {"status": "success", "results": []}
+
+        python_exe = cls.get_python_exe(cls.TTS_ENV)
+        worker_script = Path(__file__).parent / "tts_worker.py"
+
+        # Normalize paths to absolute to avoid working-dir issues.
+        normalized: list[dict] = []
+        for t in tasks:
+            output_audio = str(Path(t["output_audio"]).absolute())
+            voice = t.get("voice")
+            if voice:
+                voice = str(Path(voice).absolute())
+            normalized.append(
+                {
+                    "segment_id": t.get("segment_id"),
+                    "speaker_id": t.get("speaker_id"),
+                    "text": t.get("text", ""),
+                    "language": t.get("language"),
+                    "output_audio": output_audio,
+                    "voice": voice,
+                }
+            )
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".json",
+            delete=False,
+            encoding="utf-8",
+        ) as tf:
+            json.dump({"tasks": normalized}, tf, ensure_ascii=False)
+            batch_json = tf.name
+
+        cmd = [
+            python_exe,
+            str(worker_script),
+            "--batch-json",
+            batch_json,
+            "--device",
+            device,
+            "--tts",
+            tts_backend,
+        ]
+
+        try:
+            output_data = cls._run_worker_and_parse_json(cmd)
+        finally:
+            try:
+                os.remove(batch_json)
+            except Exception:
+                pass
+
+        if output_data.get("status") == "success":
+            logger.info(
+                "TTS batch completed successfully (%d tasks)",
+                len(tasks),
+            )
+            return output_data
+
+        raise RuntimeError(f"TTS batch failed: {output_data.get('error')}")
     
     @classmethod
     def check_envs(cls) -> Dict[str, bool]:

@@ -14,9 +14,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
-import json
+import time
 
 logger = logging.getLogger(__name__)
+
+from .audio import get_audio_duration_seconds
 
 
 class VoiceCloneMethod(Enum):
@@ -481,6 +483,108 @@ class MultiEnvWorkerSpeakerTTS(AbstractSpeakerTTS):
                 text=text,
             )
 
+    def synthesize_segments_batch(self, tts_segments: List[TTSSegment]) -> List[TTSResult]:
+        """Batch synthesize multiple segments in one `tts` worker run."""
+
+        tasks: List[dict] = []
+        for seg in tts_segments:
+            speaker = seg.speaker_profile
+            voice_reference = None
+            if speaker.clone_method == VoiceCloneMethod.ZERO_SHOT and speaker.voice_reference:
+                if os.path.exists(speaker.voice_reference):
+                    voice_reference = speaker.voice_reference
+
+            output_path = seg.output_path or f"tts_segment_{seg.segment_id:04d}.wav"
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+            tasks.append(
+                {
+                    "segment_id": seg.segment_id,
+                    "speaker_id": seg.speaker_id,
+                    "text": seg.text,
+                    "language": seg.language,
+                    "output_audio": output_path,
+                    "voice": voice_reference,
+                }
+            )
+
+        t0 = time.perf_counter()
+        out = self._env.run_tts_batch(
+            tasks,
+            device=self.device,
+            tts_backend=self.tts_backend,
+        )
+        elapsed = time.perf_counter() - t0
+
+        results_by_id: Dict[int, dict] = {}
+        for r in out.get("results", []) or []:
+            try:
+                if r.get("segment_id") is not None:
+                    results_by_id[int(r["segment_id"])] = r
+            except Exception:
+                continue
+
+        results: List[TTSResult] = []
+        for seg in tts_segments:
+            r = results_by_id.get(int(seg.segment_id))
+            if not r:
+                results.append(
+                    TTSResult(
+                        segment_id=seg.segment_id,
+                        speaker_id=seg.speaker_id,
+                        success=False,
+                        error="Missing batch result from worker",
+                        text=seg.text,
+                    )
+                )
+                continue
+
+            if r.get("status") == "success":
+                results.append(
+                    TTSResult(
+                        segment_id=seg.segment_id,
+                        speaker_id=seg.speaker_id,
+                        success=True,
+                        output_path=r.get("audio") or seg.output_path,
+                        duration=r.get("duration"),
+                        text=seg.text,
+                        metadata={
+                            "tts_backend": f"worker:{self.tts_backend}",
+                            "voice_cloning": bool(r.get("voice_cloning")),
+                            "language": seg.language,
+                            "worker_seconds": r.get("seconds"),
+                            "batch_total_seconds": elapsed,
+                            "model_load_seconds": out.get("model_load_seconds"),
+                        },
+                    )
+                )
+            else:
+                results.append(
+                    TTSResult(
+                        segment_id=seg.segment_id,
+                        speaker_id=seg.speaker_id,
+                        success=False,
+                        error=r.get("error") or "Worker reported error",
+                        text=seg.text,
+                        metadata={
+                            "tts_backend": f"worker:{self.tts_backend}",
+                            "voice_cloning": bool(r.get("voice_cloning")),
+                            "language": seg.language,
+                            "worker_seconds": r.get("seconds"),
+                            "batch_total_seconds": elapsed,
+                            "model_load_seconds": out.get("model_load_seconds"),
+                        },
+                    )
+                )
+
+        logger.info(
+            "Batch worker TTS complete: %d segments in %.2fs (backend=%s)",
+            len(tts_segments),
+            elapsed,
+            self.tts_backend,
+        )
+        return results
+
     def _get_supported_languages(self) -> List[str]:
         # Chatterbox turbo is multilingual; keep a conservative list (can be expanded).
         return [
@@ -738,6 +842,10 @@ class SpeakerTTSOrchestrator:
             except Exception:
                 source_audio_duration = None
 
+        # Build all TTSSegment objects first (so worker backends can batch).
+        tts_segments: List[TTSSegment] = []
+        reference_seconds_total = 0.0
+
         for seg in segments:
             segment_id = seg.get("id", 0)
             speaker_id = seg.get("speaker", "Unknown")
@@ -765,6 +873,8 @@ class SpeakerTTSOrchestrator:
             elif use_segment_audio_as_reference and source_audio_path:
                 try:
                     from .audio import extract_audio_clip, get_wav_duration_seconds
+
+                    ref_t0 = time.perf_counter()
 
                     seg_start = max(0.0, float(start_time))
                     seg_end = max(seg_start, float(end_time))
@@ -809,6 +919,8 @@ class SpeakerTTSOrchestrator:
                         clip_end,
                     )
 
+                    reference_seconds_total += (time.perf_counter() - ref_t0)
+
                     ref_dur = get_wav_duration_seconds(ref_path)
                     if ref_dur is not None and ref_dur <= 5.1:
                         raise RuntimeError(
@@ -840,21 +952,41 @@ class SpeakerTTSOrchestrator:
                 language=language,
                 output_path=output_path
             )
-            
-            # Synthesize
-            result = self.tts.synthesize_segment(tts_seg)
+
+            tts_segments.append(tts_seg)
+
+        # Synthesize (batch if backend supports it)
+        synth_t0 = time.perf_counter()
+        if hasattr(self.tts, "synthesize_segments_batch"):
+            backend_results = getattr(self.tts, "synthesize_segments_batch")(tts_segments)
+        else:
+            backend_results = [self.tts.synthesize_segment(s) for s in tts_segments]
+        synth_seconds_total = time.perf_counter() - synth_t0
+
+        for result in backend_results:
+            segment_id = int(result.segment_id)
             results.append(result)
             self.synthesis_results[segment_id] = result
-            
+
             if result.success:
+                if (
+                    (result.duration is None or float(result.duration) <= 0.0)
+                    and result.output_path
+                ):
+                    measured = get_audio_duration_seconds(result.output_path)
+                    if measured is not None:
+                        result.duration = float(measured)
+
                 timing_info["successful"] += 1
-                if result.duration:
-                    timing_info["total_duration"] += result.duration
-                    timing_info["segment_durations"][segment_id] = result.duration
-                logger.debug(f"Segment {segment_id}: {result.duration:.2f}s")
+                if result.duration is not None:
+                    timing_info["total_duration"] += float(result.duration)
+                    timing_info["segment_durations"][segment_id] = float(result.duration)
             else:
                 timing_info["failed"] += 1
-                logger.error(f"Segment {segment_id} failed: {result.error}")
+                logger.error("Segment %s failed: %s", segment_id, result.error)
+
+        timing_info["reference_extraction_seconds"] = reference_seconds_total
+        timing_info["tts_synthesis_seconds"] = synth_seconds_total
         
         logger.info(
             f"Synthesis complete: {timing_info['successful']}/{timing_info['total_segments']} "
@@ -867,8 +999,8 @@ class SpeakerTTSOrchestrator:
         """Get synthesized duration for each segment."""
         durations = {}
         for seg_id, result in self.synthesis_results.items():
-            if result.success and result.duration:
-                durations[seg_id] = result.duration
+            if result.success and result.duration is not None:
+                durations[seg_id] = float(result.duration)
         return durations
     
     def get_synthesis_report(self) -> Dict:

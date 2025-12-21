@@ -1,6 +1,10 @@
 import os
 import logging
 import re
+import time
+import random
+import collections
+import threading
 from abc import ABC, abstractmethod
 from typing import Optional, Sequence, Literal
 
@@ -11,6 +15,98 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     OpenAI = None
     AzureOpenAI = None
+
+
+class _GroqRateLimiter:
+    """Process-wide rate limiter for Groq requests.
+
+    Shared across all `GroqTranslator` instances; safe for multi-threaded use.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._request_times = collections.deque()  # monotonic timestamps
+        self._last_request_time: float = 0.0
+        self._configured = False
+
+        self._rpm: int = 0
+        self._window_seconds: float = 60.0
+        self._min_delay_seconds: float = 0.0
+        self._safety_seconds: float = 0.5
+        self._effective_rpm: int = 0
+
+    def configure(
+        self,
+        *,
+        rpm: int,
+        window_seconds: float,
+        min_delay_seconds: float,
+        safety_seconds: float,
+        effective_rpm: int,
+    ) -> None:
+        with self._lock:
+            self._rpm = max(0, int(rpm))
+            self._window_seconds = max(1.0, float(window_seconds))
+            self._min_delay_seconds = max(0.0, float(min_delay_seconds))
+            self._safety_seconds = max(0.0, float(safety_seconds))
+            self._effective_rpm = int(effective_rpm)
+            self._configured = True
+
+    def _allowed_rpm(self) -> int:
+        if self._rpm <= 0:
+            return 0
+        if self._effective_rpm > 0:
+            return max(1, min(self._rpm, self._effective_rpm))
+        return max(1, self._rpm - 1)
+
+    def acquire(self) -> None:
+        if not self._configured:
+            return
+
+        while True:
+            now = time.monotonic()
+            sleep_for = 0.0
+
+            with self._lock:
+                if self._min_delay_seconds > 0:
+                    since_last = now - self._last_request_time
+                    if since_last < self._min_delay_seconds:
+                        sleep_for = max(
+                            sleep_for,
+                            self._min_delay_seconds - since_last,
+                        )
+
+                allowed = self._allowed_rpm()
+                if allowed > 0:
+                    window = self._window_seconds
+                    while (
+                        self._request_times
+                        and (now - self._request_times[0]) >= window
+                    ):
+                        self._request_times.popleft()
+
+                    if len(self._request_times) >= allowed:
+                        oldest = self._request_times[0]
+                        until_ok = window - (now - oldest)
+                        sleep_for = max(
+                            sleep_for,
+                            until_ok + self._safety_seconds,
+                        )
+
+                if sleep_for <= 0:
+                    self._last_request_time = now
+                    if allowed > 0:
+                        self._request_times.append(now)
+                    return
+
+            logger.warning(
+                "Groq rate limit reached. Sleeping %.2fs",
+                sleep_for,
+            )
+            time.sleep(sleep_for)
+
+
+_GROQ_LIMITER = _GroqRateLimiter()
 
 
 class AbstractTranslator(ABC):
@@ -173,7 +269,8 @@ class OpenAITranslator(AbstractTranslator):
             raise ValueError(
                 "OPENAI_API_KEY not found. Set it as environment variable "
                 "or pass api_key parameter. "
-                "For free alternatives, see GroqTranslator or OllamaTranslator."
+                "For free alternatives, see GroqTranslator or "
+                "OllamaTranslator."
             )
         
         self.model = model
@@ -395,7 +492,105 @@ class GroqTranslator(AbstractTranslator):
             )
 
         self.model = model
-        self.client = Groq(api_key=self.api_key)
+        # Disable Groq SDK internal retries if supported.
+        # We implement retries ourselves so *every* attempt passes through our
+        # limiter.
+        try:
+            self.client = Groq(api_key=self.api_key, max_retries=0)
+        except TypeError:
+            self.client = Groq(api_key=self.api_key)
+
+        # Groq free tier can rate-limit for many segment calls.
+        # These knobs keep the pipeline robust without requiring callers to
+        # manage retries.
+        self._min_delay_seconds = float(
+            os.environ.get("GROQ_MIN_DELAY_SECONDS", "0.3")
+        )
+
+        # Hard RPM cap (requests/minute). This is the most common reason for
+        # 429s when translating many short segments.
+        # Set GROQ_RPM to your account's limit (example: 30). Set to 0 to
+        # disable.
+        self._rpm = int(os.environ.get("GROQ_RPM", "30"))
+        self._rpm_window_seconds = float(
+            os.environ.get("GROQ_RPM_WINDOW_SECONDS", "60")
+        )
+
+        # A small safety buffer helps with server-side bucket boundaries,
+        # network jitter, and clock differences.
+        self._rpm_safety_seconds = float(
+            os.environ.get("GROQ_RPM_SAFETY_SECONDS", "0.5")
+        )
+        self._effective_rpm = int(
+            os.environ.get("GROQ_EFFECTIVE_RPM", "0")
+        )
+
+        self._max_retries = int(os.environ.get("GROQ_MAX_RETRIES", "8"))
+        self._backoff_initial_seconds = float(
+            os.environ.get("GROQ_BACKOFF_INITIAL_SECONDS", "2.5")
+        )
+        self._backoff_max_seconds = float(
+            os.environ.get("GROQ_BACKOFF_MAX_SECONDS", "30.0")
+        )
+
+        _GROQ_LIMITER.configure(
+            rpm=self._rpm,
+            window_seconds=self._rpm_window_seconds,
+            min_delay_seconds=self._min_delay_seconds,
+            safety_seconds=self._rpm_safety_seconds,
+            effective_rpm=self._effective_rpm,
+        )
+
+    @staticmethod
+    def _is_rate_limit_error(exc: Exception) -> bool:
+        name = exc.__class__.__name__.lower()
+        msg = str(exc).lower()
+        if "ratelimit" in name or "rate limit" in msg:
+            return True
+        if "429" in msg or "too many requests" in msg:
+            return True
+        status = getattr(exc, "status_code", None)
+        if status == 429:
+            return True
+        return False
+
+    def _call_with_retries(self, prompt: str) -> str:
+        last_exc: Optional[Exception] = None
+        for attempt in range(self._max_retries + 1):
+            # Proactively respect RPM + minimum spacing between calls.
+            _GROQ_LIMITER.acquire()
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=2000,
+                )
+                return resp.choices[0].message.content.strip()
+            except Exception as e:
+                last_exc = e
+                if (
+                    (not self._is_rate_limit_error(e))
+                    or attempt >= self._max_retries
+                ):
+                    logger.error("Groq translation failed: %s", str(e))
+                    raise
+
+                # Exponential backoff with small jitter.
+                delay = min(
+                    self._backoff_max_seconds,
+                    self._backoff_initial_seconds * (2 ** attempt),
+                )
+                delay += random.uniform(0.0, min(1.0, 0.25 * delay))
+                logger.warning(
+                    "Groq rate limited (429). Retrying in %.2fs (%d/%d)",
+                    delay,
+                    attempt + 1,
+                    self._max_retries,
+                )
+                time.sleep(delay)
+
+        # Should never reach here, but keep type-checkers happy.
+        raise last_exc if last_exc else RuntimeError("Groq translation failed")
 
     def translate(
         self,
@@ -410,17 +605,7 @@ class GroqTranslator(AbstractTranslator):
         )
 
         logger.info("Sending translation to Groq model %s", self.model)
-        try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=2000,
-            )
-            out = resp.choices[0].message.content.strip()
-            return out
-        except Exception as e:
-            logger.error("Groq translation failed: %s", str(e))
-            raise
+        return self._call_with_retries(prompt)
 
     def translate_with_context(
         self,
@@ -448,12 +633,7 @@ class GroqTranslator(AbstractTranslator):
             "Sending context-aware translation to Groq model %s",
             self.model,
         )
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=2000,
-        )
-        return resp.choices[0].message.content.strip()
+        return self._call_with_retries(prompt)
 
 
 class OllamaTranslator(AbstractTranslator):

@@ -17,6 +17,9 @@ import logging
 import argparse
 import os
 from pathlib import Path
+import time
+import wave
+import contextlib
 
 # Add parent directory to path so we can import src
 parent_dir = Path(__file__).parent.parent
@@ -125,9 +128,19 @@ def _allow_anonymous_hf_downloads_if_needed(hf_token: str | None = None) -> None
 
 def main():
     parser = argparse.ArgumentParser(description="TTS Worker for multiple TTS backends")
-    parser.add_argument("text", help="Text to synthesize")
-    parser.add_argument("language", help="Language code (e.g., 'en', 'es', 'fr')")
-    parser.add_argument("output_audio", help="Output audio file path")
+    parser.add_argument("text", nargs="?", default=None, help="Text to synthesize")
+    parser.add_argument(
+        "language",
+        nargs="?",
+        default=None,
+        help="Language code (e.g., 'en', 'es', 'fr')",
+    )
+    parser.add_argument(
+        "output_audio",
+        nargs="?",
+        default=None,
+        help="Output audio file path",
+    )
     parser.add_argument("--voice", default=None, help="Voice/reference audio (optional)")
     parser.add_argument("--device", default="cpu", help="Device: 'cpu' or 'cuda' (for Chatterbox/Coqui)")
     parser.add_argument(
@@ -135,14 +148,46 @@ def main():
         default="pyttsx3",
         help="TTS backend: pyttsx3 (default), chatterbox, or coqui (if available)",
     )
+    parser.add_argument(
+        "--batch-json",
+        default=None,
+        help="Path to a JSON file containing a list of TTS tasks to run.",
+    )
     
     args = parser.parse_args()
     
-    logger.info(f"TTS Worker: Synthesizing '{args.text}' (language: {args.language}, backend: {args.tts})")
+    def _wav_duration_seconds(path: str) -> float | None:
+        try:
+            with contextlib.closing(wave.open(path, "rb")) as wf:
+                frames = wf.getnframes()
+                rate = wf.getframerate()
+                if not rate:
+                    return None
+                return float(frames) / float(rate)
+        except Exception:
+            return None
+
+    if args.batch_json:
+        logger.info(
+            "TTS Worker: Batch mode (%s) backend=%s device=%s",
+            args.batch_json,
+            args.tts,
+            args.device,
+        )
+    else:
+        logger.info(
+            "TTS Worker: Synthesizing '%s' (language: %s, backend: %s)",
+            args.text,
+            args.language,
+            args.tts,
+        )
     
     try:
-        if args.tts.lower() == "chatterbox":
-            logger.info(f"Loading ChatterboxTurboTTS model (device: {args.device})...")
+        backend = args.tts.lower()
+
+        if backend == "chatterbox":
+            logger.info("Loading ChatterboxTurboTTS model (device: %s)...", args.device)
+            load_t0 = time.perf_counter()
 
             try:
                 from chatterbox.tts_turbo import ChatterboxTurboTTS
@@ -201,17 +246,107 @@ def main():
                     # Back-compat: older chatterbox-tts may not accept hf_kwargs/token.
                     model = ChatterboxTurboTTS.from_pretrained(device=args.device)
 
-                logger.info("✓ ChatterboxTurboTTS model loaded successfully")
+                load_seconds = time.perf_counter() - load_t0
+                logger.info(
+                    "✓ ChatterboxTurboTTS model loaded successfully (%.2fs)",
+                    load_seconds,
+                )
 
-                # Generate audio (with optional voice cloning)
-                if args.voice and os.path.exists(args.voice):
-                    logger.info(f"Synthesizing with voice cloning: {args.voice}")
-                    wav = model.generate(args.text, audio_prompt_path=args.voice)
-                else:
-                    wav = model.generate(args.text)
+                def _synth_one(
+                    *,
+                    text: str,
+                    output_audio: str,
+                    voice: str | None,
+                ) -> None:
+                    if voice and os.path.exists(voice):
+                        wav = model.generate(text, audio_prompt_path=voice)
+                    else:
+                        wav = model.generate(text)
+                    sr = getattr(model, "sr", 24000)
+                    ta.save(output_audio, wav, sr)
 
-                sr = getattr(model, "sr", 24000)
-                ta.save(args.output_audio, wav, sr)
+                if args.batch_json:
+                    with open(args.batch_json, "r", encoding="utf-8") as f:
+                        payload = json.load(f)
+                    tasks = payload.get("tasks") or []
+                    results: list[dict] = []
+
+                    for t in tasks:
+                        seg_id = t.get("segment_id")
+                        speaker_id = t.get("speaker_id")
+                        text = t.get("text") or ""
+                        language = t.get("language")
+                        output_audio = t.get("output_audio")
+                        voice = t.get("voice")
+
+                        if not output_audio:
+                            results.append(
+                                {
+                                    "segment_id": seg_id,
+                                    "speaker_id": speaker_id,
+                                    "status": "error",
+                                    "error": "Missing output_audio",
+                                }
+                            )
+                            continue
+
+                        t0 = time.perf_counter()
+                        try:
+                            _synth_one(
+                                text=text,
+                                output_audio=output_audio,
+                                voice=voice,
+                            )
+                            dur = _wav_duration_seconds(output_audio)
+                            results.append(
+                                {
+                                    "segment_id": seg_id,
+                                    "speaker_id": speaker_id,
+                                    "status": "success",
+                                    "audio": output_audio,
+                                    "duration": dur,
+                                    "seconds": time.perf_counter() - t0,
+                                    "language": language,
+                                    "voice_cloning": bool(voice),
+                                }
+                            )
+                        except Exception as e:
+                            results.append(
+                                {
+                                    "segment_id": seg_id,
+                                    "speaker_id": speaker_id,
+                                    "status": "error",
+                                    "error": str(e),
+                                    "seconds": time.perf_counter() - t0,
+                                    "language": language,
+                                    "voice_cloning": bool(voice),
+                                }
+                            )
+
+                    print(
+                        json.dumps(
+                            {
+                                "status": "success",
+                                "backend": "chatterbox-turbo",
+                                "device": args.device,
+                                "model_load_seconds": load_seconds,
+                                "results": results,
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                    return
+
+                # Single-item mode
+                if not args.text or not args.output_audio:
+                    raise RuntimeError(
+                        "Missing args: text and output_audio required unless --batch-json is used"
+                    )
+                _synth_one(
+                    text=args.text,
+                    output_audio=args.output_audio,
+                    voice=args.voice,
+                )
                 backend_used = "chatterbox-turbo"
 
             except Exception as e:
@@ -231,8 +366,9 @@ def main():
                     f"Original error: {e}"
                 )
 
-        elif args.tts.lower() == "coqui":
-            logger.info(f"Loading Coqui TTS xtts_v2 model (device: {args.device})...")
+        elif backend == "coqui":
+            logger.info("Loading Coqui TTS xtts_v2 model (device: %s)...", args.device)
+            load_t0 = time.perf_counter()
             
             try:
                 from TTS.api import TTS
@@ -243,27 +379,114 @@ def main():
                     gpu=(args.device == "cuda"),
                     progress_bar=False
                 )
-                logger.info("✓ xtts_v2 model loaded successfully")
+                load_seconds = time.perf_counter() - load_t0
+                logger.info("✓ xtts_v2 model loaded successfully (%.2fs)", load_seconds)
+
+                def _synth_one(
+                    *,
+                    text: str,
+                    language: str,
+                    output_audio: str,
+                    voice: str | None,
+                ) -> None:
+                    if voice and os.path.exists(voice):
+                        tts.tts_to_file(
+                            text=text,
+                            file_path=output_audio,
+                            speaker_wav=voice,
+                            language=language,
+                        )
+                    else:
+                        tts.tts_to_file(
+                            text=text,
+                            file_path=output_audio,
+                            language=language,
+                        )
+
+                if args.batch_json:
+                    with open(args.batch_json, "r", encoding="utf-8") as f:
+                        payload = json.load(f)
+                    tasks = payload.get("tasks") or []
+                    results: list[dict] = []
+
+                    for t in tasks:
+                        seg_id = t.get("segment_id")
+                        speaker_id = t.get("speaker_id")
+                        text = t.get("text") or ""
+                        language = t.get("language") or args.language or "en"
+                        output_audio = t.get("output_audio")
+                        voice = t.get("voice")
+
+                        if not output_audio:
+                            results.append(
+                                {
+                                    "segment_id": seg_id,
+                                    "speaker_id": speaker_id,
+                                    "status": "error",
+                                    "error": "Missing output_audio",
+                                }
+                            )
+                            continue
+
+                        t0 = time.perf_counter()
+                        try:
+                            _synth_one(
+                                text=text,
+                                language=language,
+                                output_audio=output_audio,
+                                voice=voice,
+                            )
+                            dur = _wav_duration_seconds(output_audio)
+                            results.append(
+                                {
+                                    "segment_id": seg_id,
+                                    "speaker_id": speaker_id,
+                                    "status": "success",
+                                    "audio": output_audio,
+                                    "duration": dur,
+                                    "seconds": time.perf_counter() - t0,
+                                    "language": language,
+                                    "voice_cloning": bool(voice),
+                                }
+                            )
+                        except Exception as e:
+                            results.append(
+                                {
+                                    "segment_id": seg_id,
+                                    "speaker_id": speaker_id,
+                                    "status": "error",
+                                    "error": str(e),
+                                    "seconds": time.perf_counter() - t0,
+                                    "language": language,
+                                    "voice_cloning": bool(voice),
+                                }
+                            )
+
+                    print(
+                        json.dumps(
+                            {
+                                "status": "success",
+                                "backend": "coqui-xtts_v2",
+                                "device": args.device,
+                                "model_load_seconds": load_seconds,
+                                "results": results,
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                    return
                 
-                # Synthesize with xtts_v2
-                if args.voice and os.path.exists(args.voice):
-                    # Zero-shot voice cloning with reference audio
-                    logger.info(f"Synthesizing with voice cloning: {args.voice}")
-                    tts.tts_to_file(
-                        text=args.text,
-                        file_path=args.output_audio,
-                        speaker_wav=args.voice,
-                        language=args.language
+                if not args.text or not args.output_audio or not args.language:
+                    raise RuntimeError(
+                        "Missing args: text/language/output_audio required unless --batch-json is used"
                     )
-                else:
-                    # Standard synthesis with default voice
-                    logger.info(f"Synthesizing for language: {args.language}")
-                    tts.tts_to_file(
-                        text=args.text,
-                        file_path=args.output_audio,
-                        language=args.language
-                    )
-                backend_used = "coqui"
+                _synth_one(
+                    text=args.text,
+                    language=args.language,
+                    output_audio=args.output_audio,
+                    voice=args.voice,
+                )
+                backend_used = "coqui-xtts_v2"
                 
             except ImportError as e:
                 logger.warning(f"Coqui TTS not available: {e}. Falling back to pyttsx3...")

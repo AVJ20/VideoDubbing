@@ -13,6 +13,7 @@ import argparse
 import logging
 import os
 import sys
+import re
 
 from src.env_loader import load_env
 
@@ -21,6 +22,35 @@ load_env()
 
 logging.basicConfig(level=logging.INFO, format='%(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+_TIME_RE = re.compile(
+    r"^(?:(?P<h>\d+):)?(?P<m>[0-5]?\d):(?P<s>[0-5]?\d(?:\.\d+)?)$"
+)
+
+
+def _parse_time_seconds(value: str) -> float:
+    """Parse seconds or HH:MM:SS[.ms] into float seconds."""
+    if value is None:
+        raise ValueError("time value is None")
+    v = str(value).strip()
+    if not v:
+        raise ValueError("empty time value")
+    try:
+        return float(v)
+    except ValueError:
+        pass
+
+    m = _TIME_RE.match(v)
+    if not m:
+        raise ValueError(
+            f"Invalid time '{value}'. Use seconds (e.g. 12.5) "
+            "or HH:MM:SS(.ms) (e.g. 00:01:12.500)."
+        )
+    hours = float(m.group("h") or 0)
+    minutes = float(m.group("m") or 0)
+    seconds = float(m.group("s") or 0)
+    return hours * 3600.0 + minutes * 60.0 + seconds
 
 
 def main():
@@ -37,6 +67,22 @@ def main():
     parser.add_argument("--tts-device", default="cpu", choices=["cpu", "cuda"],
                        help="Device for TTS synthesis: 'cpu' or 'cuda' (GPU)")
     parser.add_argument("--output-dir", default=None, help="Output directory for results (default: work/output)")
+    parser.add_argument(
+        "--start",
+        default=None,
+        help=(
+            "Start time for dubbing (seconds or HH:MM:SS[.ms]). "
+            "If set, only this part of the video is dubbed."
+        ),
+    )
+    parser.add_argument(
+        "--end",
+        default=None,
+        help=(
+            "End time for dubbing (seconds or HH:MM:SS[.ms]). "
+            "Requires --start."
+        ),
+    )
 
     args = parser.parse_args()
     
@@ -47,6 +93,19 @@ def main():
         parser.error("Provide only one of --url or --file, not both")
     
     os.makedirs(args.work_dir, exist_ok=True)
+
+    clip_start = None
+    clip_end = None
+    if args.start is not None:
+        clip_start = _parse_time_seconds(args.start)
+        if clip_start < 0:
+            parser.error("--start must be >= 0")
+        if args.end is not None:
+            clip_end = _parse_time_seconds(args.end)
+            if clip_end <= clip_start:
+                parser.error("--end must be greater than --start")
+    elif args.end is not None:
+        parser.error("--end requires --start")
 
     try:
         if args.enhanced:
@@ -109,6 +168,33 @@ def main():
             if not args.file:
                 logger.error("No video file or URL provided")
                 sys.exit(1)
+
+            # If a clip is requested, generate a temporary clipped video and
+            # run the pipeline on that clip.
+            if clip_start is not None:
+                from src.audio import extract_video_clip
+
+                clips_dir = os.path.join(args.work_dir, "clips")
+                os.makedirs(clips_dir, exist_ok=True)
+                base = os.path.splitext(os.path.basename(args.file))[0]
+                end_label = f"{clip_end:.3f}" if clip_end is not None else "end"
+                clipped_path = os.path.join(
+                    clips_dir,
+                    f"{base}_clip_{clip_start:.3f}_{end_label}.mp4",
+                )
+                logger.info(
+                    "Clipping video: start=%s end=%s -> %s",
+                    clip_start,
+                    clip_end,
+                    clipped_path,
+                )
+                extract_video_clip(
+                    args.file,
+                    clipped_path,
+                    start_time=clip_start,
+                    end_time=clip_end,
+                )
+                args.file = clipped_path
             
             result = pipeline.run(
                 video_path=args.file,
@@ -117,6 +203,31 @@ def main():
             )
         else:
             # Standard pipelines support both URL and file
+            if args.file and clip_start is not None:
+                from src.audio import extract_video_clip
+
+                clips_dir = os.path.join(args.work_dir, "clips")
+                os.makedirs(clips_dir, exist_ok=True)
+                base = os.path.splitext(os.path.basename(args.file))[0]
+                end_label = f"{clip_end:.3f}" if clip_end is not None else "end"
+                clipped_path = os.path.join(
+                    clips_dir,
+                    f"{base}_clip_{clip_start:.3f}_{end_label}.mp4",
+                )
+                logger.info(
+                    "Clipping video: start=%s end=%s -> %s",
+                    clip_start,
+                    clip_end,
+                    clipped_path,
+                )
+                extract_video_clip(
+                    args.file,
+                    clipped_path,
+                    start_time=clip_start,
+                    end_time=clip_end,
+                )
+                args.file = clipped_path
+
             result = pipeline.run(
                 source_lang=args.source,
                 target_lang=args.target,
@@ -132,14 +243,22 @@ def main():
         if args.enhanced:
             # Enhanced pipeline outputs detailed results
             logger.info("Results (Enhanced Pipeline):")
-            logger.info(f"  Source Language: {result.get('source_lang', 'N/A')}")
-            logger.info(f"  Target Language: {result.get('target_lang', 'N/A')}")
-            logger.info(f"  Segments: {len(result.get('segmentation', {}).get('segments', []))} audio segments")
-            logger.info(f"  Output Directory: {result.get('output_dir', 'N/A')}")
+            logger.info(f"  Source Language: {result.get('source_language', 'N/A')}")
+            logger.info(f"  Target Language: {result.get('target_language', 'N/A')}")
+            logger.info(f"  Video: {result.get('video_path', 'N/A')}")
+
+            stages = result.get('stages', {})
+            seg_stage = stages.get('segmentation', {})
+            out_stage = stages.get('output', {})
+
+            logger.info(f"  Segments: {seg_stage.get('segments', 'N/A')}")
+            logger.info(f"  Output Directory: {out_stage.get('output_directory', output_dir)}")
             logger.info(f"  Segment Audio Files: {output_dir}/segments/")
-            logger.info(f"  Synthesis Report: {result.get('outputs', {}).get('synthesis_report', 'N/A')}")
-            logger.info(f"  Segments Metadata: {result.get('outputs', {}).get('segments_metadata', 'N/A')}")
-            logger.info(f"  Alignment Info: {result.get('outputs', {}).get('alignment_info', 'N/A')}")
+            logger.info(f"  Dubbed Audio: {out_stage.get('dubbed_audio', 'N/A')}")
+            logger.info(f"  Dubbed Video: {out_stage.get('dubbed_video', 'N/A')}")
+            logger.info(f"  Synthesis Report: {out_stage.get('synthesis_report', 'N/A')}")
+            logger.info(f"  Segments Metadata: {out_stage.get('segments_metadata', 'N/A')}")
+            logger.info(f"  Alignment Metadata: {out_stage.get('alignment_metadata', 'N/A')}")
         else:
             # Standard pipeline outputs
             logger.info("Results (Standard Pipeline):")

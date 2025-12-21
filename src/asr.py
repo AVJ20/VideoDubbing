@@ -35,7 +35,13 @@ class WhisperASR(AbstractASR):
 
     def transcribe(self, audio_path: str, language: str = "en") -> ASRResult:
         logger.info("Transcribing with whisper: %s (language: %s)", audio_path, language)
-        result = self.model.transcribe(audio_path, language=language)
+        # Word-level timestamps are optional and depend on the installed whisper version.
+        # Try to enable them, but fall back gracefully if unsupported.
+        kwargs = {"language": None if (language or "").lower() == "auto" else language}
+        try:
+            result = self.model.transcribe(audio_path, verbose=False, word_timestamps=True, **kwargs)
+        except TypeError:
+            result = self.model.transcribe(audio_path, **kwargs)
         text = result.get("text", "")
         segments = result.get("segments") or []
         return ASRResult(text=text, segments=segments)
@@ -126,7 +132,21 @@ class WhisperWithDiarizationASR(AbstractASR):
         logger.info("Transcribing with Whisper: %s (language: %s)", audio_path, language)
 
         # Step 1: Whisper transcription (get text + timing)
-        whisper_result = self.whisper_model.transcribe(audio_path, language=language, verbose=False)
+        # Request word-level timestamps when supported by the installed whisper package.
+        whisper_kwargs = {"language": None if (language or "").lower() == "auto" else language}
+        try:
+            whisper_result = self.whisper_model.transcribe(
+                audio_path,
+                verbose=False,
+                word_timestamps=True,
+                **whisper_kwargs,
+            )
+        except TypeError:
+            whisper_result = self.whisper_model.transcribe(
+                audio_path,
+                verbose=False,
+                **whisper_kwargs,
+            )
         whisper_segments = whisper_result.get("segments", [])
 
         logger.info("Whisper found %d segments", len(whisper_segments))

@@ -22,18 +22,18 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple
 import json
+import subprocess
+from datetime import datetime, timezone
 
-from .audio import extract_audio
+from .audio import extract_audio, get_audio_duration_seconds
 from .asr import AbstractASR, WhisperWithDiarizationASR, ASRResult
 from .segmentation import AudioSegmenter, SegmentationResult, SegmentationValidator, Segment
 from .alignment import SegmentAligner, TimingAnalyzer, AlignmentStrategy
 from .speaker_tts import (
-    SpeakerTTSOrchestrator, 
-    AbstractSpeakerTTS, 
-    CoquiSpeakerTTS,
+    SpeakerTTSOrchestrator,
+    AbstractSpeakerTTS,
     ChatterboxSpeakerTTS,
     ElevenLabsSpeakerTTS,
-    SpeakerProfile,
     create_speaker_profiles_from_segments
 )
 from .translator import AbstractTranslator, GroqTranslator
@@ -54,7 +54,7 @@ class DetailedPipelineConfig:
     speaker_change_threshold: float = 0.1
     
     # Alignment
-    alignment_strategy: AlignmentStrategy = AlignmentStrategy.ADAPTIVE
+    alignment_strategy: AlignmentStrategy = AlignmentStrategy.STRICT
     max_timing_drift: float = 2.0
     
     # TTS
@@ -255,6 +255,21 @@ class DetailedDubbingPipeline:
             result["stages"]["translation"] = {
                 "segments_translated": len(translated_segments)
             }
+
+            # Persist segment-level artifacts for evaluation/debugging.
+            try:
+                artifact_paths = self._save_segment_level_artifacts(
+                    asr_result=asr_result,
+                    segments=segmentation_result.segments,
+                    translated_segments=translated_segments,
+                )
+                result["stages"]["segment_artifacts"] = artifact_paths
+            except Exception as e:
+                logger.warning(
+                    "Failed to save segment-level artifacts: %s",
+                    str(e),
+                    exc_info=True,
+                )
             
             # Stage 6: TTS synthesis
             self.state.stage = "tts_synthesis"
@@ -300,6 +315,152 @@ class DetailedDubbingPipeline:
         self._save_metadata(result)
         
         return result
+
+    def _save_segment_level_artifacts(
+        self,
+        *,
+        asr_result: ASRResult,
+        segments: List[Segment],
+        translated_segments: List[dict],
+    ) -> Dict[str, str]:
+        """Write segment-level outputs used for evaluation/debugging.
+
+        Stores:
+        - Raw ASR segments (with timings + speaker if available)
+        - Segmentation segments + per-segment translation
+        - A combined report that links segmentation segments to overlapping
+          ASR subsegments
+        """
+
+        os.makedirs(self.config.output_dir, exist_ok=True)
+
+        clip_start_offset = float(self.state.metadata.get("clip_start", 0.0) or 0.0)
+        clip_end_offset = self.state.metadata.get("clip_end", None)
+        if clip_end_offset is not None:
+            clip_end_offset = float(clip_end_offset)
+
+        # Normalize ASR segments to a consistent schema.
+        normalized_asr_segments: List[dict] = []
+        for idx, s in enumerate(asr_result.segments or []):
+            start = float(s.get("offset", s.get("start", 0.0)) or 0.0)
+            duration = float(s.get("duration", 0.0) or 0.0)
+            end = float(s.get("end", start + duration) or (start + duration))
+
+            # Normalize word-level timestamps when available.
+            normalized_words: List[dict] = []
+            for w in (s.get("words") or []):
+                if not isinstance(w, dict):
+                    continue
+                w_start = w.get("start_time", w.get("start"))
+                w_end = w.get("end_time", w.get("end"))
+                try:
+                    w_start_f = float(w_start) if w_start is not None else None
+                except Exception:
+                    w_start_f = None
+                try:
+                    w_end_f = float(w_end) if w_end is not None else None
+                except Exception:
+                    w_end_f = None
+
+                normalized_words.append(
+                    {
+                        "word": w.get("word") or w.get("text") or w.get("token") or "",
+                        "start_time": w_start_f,
+                        "end_time": w_end_f,
+                        "start_time_global": (w_start_f + clip_start_offset) if w_start_f is not None else None,
+                        "end_time_global": (w_end_f + clip_start_offset) if w_end_f is not None else None,
+                        "probability": w.get("probability", w.get("prob")),
+                    }
+                )
+            if end < start:
+                end = start
+
+            normalized_asr_segments.append(
+                {
+                    "index": idx,
+                    "start_time": start,
+                    "end_time": end,
+                    "duration": max(0.0, end - start),
+                    "start_time_global": start + clip_start_offset,
+                    "end_time_global": end + clip_start_offset,
+                    "speaker": s.get("speaker", "Unknown"),
+                    "words": normalized_words,
+                    "text": (s.get("text") or "").strip(),
+                    "confidence": s.get("confidence", 1.0),
+                }
+            )
+
+        # Index translations by segment id.
+        translated_by_id: Dict[int, dict] = {
+            int(t.get("id")): t for t in (translated_segments or [])
+            if t.get("id") is not None
+        }
+
+        # Build per-seg report linking to overlapping ASR subsegments.
+        combined_segments: List[dict] = []
+        for seg in segments:
+            seg_start = float(seg.start_time)
+            seg_end = float(seg.end_time)
+            overlap_asr = [
+                a
+                for a in normalized_asr_segments
+                if (a["end_time"] > seg_start) and (a["start_time"] < seg_end)
+            ]
+
+            translated_entry = translated_by_id.get(int(seg.id))
+            combined_segments.append(
+                {
+                    "id": int(seg.id),
+                    "speaker": seg.speaker,
+                    "start_time": seg_start,
+                    "end_time": seg_end,
+                    "duration": float(seg.duration),
+                    "start_time_global": seg_start + clip_start_offset,
+                    "end_time_global": seg_end + clip_start_offset,
+                    "confidence": seg.confidence,
+                    "asr_text": seg.text,
+                    "translated_text": (
+                        (translated_entry or {}).get("text")
+                        or ""
+                    ).strip(),
+                    "asr_subsegments": overlap_asr,
+                }
+            )
+
+        report = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "video_path": self.state.video_path,
+            "audio_path": self.state.audio_path,
+            "clip_start": clip_start_offset,
+            "clip_end": clip_end_offset,
+            "source_language": self.state.source_language,
+            "target_language": self.state.target_language,
+            "asr_segments": normalized_asr_segments,
+            "segments": combined_segments,
+        }
+
+        asr_path = os.path.join(self.config.output_dir, "asr_segments.json")
+        translated_path = os.path.join(
+            self.config.output_dir,
+            "translated_segments.json",
+        )
+        report_path = os.path.join(
+            self.config.output_dir,
+            "segment_report.json",
+        )
+
+        with open(asr_path, "w", encoding="utf-8") as f:
+            json.dump(normalized_asr_segments, f, indent=2, ensure_ascii=False)
+        with open(translated_path, "w", encoding="utf-8") as f:
+            json.dump(translated_segments, f, indent=2, ensure_ascii=False)
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+
+        return {
+            "asr_segments": asr_path,
+            "translated_segments": translated_path,
+            "segment_report": report_path,
+        }
     
     def _extract_audio(self, video_path: str) -> str:
         """Extract audio from video."""
@@ -480,13 +641,189 @@ class DetailedDubbingPipeline:
         alignment_path = os.path.join(self.config.output_dir, "alignment.json")
         with open(alignment_path, 'w') as f:
             json.dump(alignment_metadata, f, indent=2)
+
+        dubbed_audio_path = os.path.join(self.config.output_dir, "dubbed_audio.wav")
+        dubbed_video_path = os.path.join(self.config.output_dir, "dubbed_video.mp4")
+
+        try:
+            self._compose_dubbed_audio(
+                segments=segments,
+                tts_results=tts_results,
+                out_audio_path=dubbed_audio_path,
+                max_speed_change=None,
+            )
+            self._mux_dubbed_video(
+                input_video_path=self.state.video_path,
+                dubbed_audio_path=dubbed_audio_path,
+                out_video_path=dubbed_video_path,
+            )
+        except Exception as e:
+            logger.error("Failed to generate final dubbed audio/video: %s", str(e), exc_info=True)
         
         return {
             "synthesis_report": synthesis_report_path,
             "segments_metadata": segments_path,
             "alignment_metadata": alignment_path,
+            "dubbed_audio": dubbed_audio_path,
+            "dubbed_video": dubbed_video_path,
             "output_directory": self.config.output_dir
         }
+
+    @staticmethod
+    def _run_ffmpeg(cmd: List[str]) -> None:
+        logger.info("Running ffmpeg: %s", " ".join(cmd))
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "").strip()
+            raise RuntimeError(f"ffmpeg failed: {stderr}")
+
+    def _compose_dubbed_audio(
+        self,
+        segments: List[Segment],
+        tts_results: List,
+        out_audio_path: str,
+                max_speed_change: Optional[float] = None,
+    ) -> str:
+        """Compose a full dubbed audio track aligned to the original timeline.
+
+                Each segment is forced to fit exactly within its original time slot
+                ($start_time \rightarrow end_time$) by adjusting playback speed ("speaking
+                rate") and then padding/trimming to the slot duration.
+
+                - When `max_speed_change` is None, the required tempo change is applied
+                    (via chained ffmpeg `atempo` filters) to best match the slot.
+                - When `max_speed_change` is set (e.g. 0.15 for ±15%), the tempo change is
+                    clamped, and any remaining mismatch is resolved by trim/pad so segment
+                    boundaries still align.
+        """
+        os.makedirs(os.path.dirname(out_audio_path) or ".", exist_ok=True)
+
+        tts_by_id: Dict[int, object] = {
+            int(r.segment_id): r
+            for r in tts_results
+            if getattr(r, "success", False) and getattr(r, "output_path", None)
+        }
+
+        def _atempo_chain(factor: float) -> str:
+            """Return a comma-separated atempo chain for a desired overall factor.
+
+            ffmpeg's `atempo` accepts values in [0.5, 2.0]. Chaining multiplies.
+            """
+            try:
+                f = float(factor)
+            except Exception:
+                f = 1.0
+            if f <= 0.0:
+                f = 1.0
+
+            parts: List[str] = []
+            remaining = f
+            while remaining < 0.5:
+                parts.append("atempo=0.5")
+                remaining /= 0.5
+            while remaining > 2.0:
+                parts.append("atempo=2.0")
+                remaining /= 2.0
+            parts.append(f"atempo={remaining:.5f}")
+            return ",".join(parts)
+
+        inputs: List[Tuple[str, float, int, float]] = []
+        for seg in segments:
+            tts_res = tts_by_id.get(int(seg.id))
+            if not tts_res:
+                continue
+
+            src_dur = max(0.05, float(seg.end_time) - float(seg.start_time))
+            tts_dur = getattr(tts_res, "duration", None)
+            if tts_dur is None or float(tts_dur) <= 0.0:
+                tts_dur = get_audio_duration_seconds(tts_res.output_path) or src_dur
+
+            # atempo factor: output_duration = input_duration / atempo
+            # For exact slot fit, we want output_duration == src_dur.
+            required_atempo = float(tts_dur) / float(src_dur) if src_dur > 0 else 1.0
+
+            applied_atempo = required_atempo
+            if max_speed_change is not None:
+                min_atempo = 1.0 - float(max_speed_change)
+                max_atempo = 1.0 + float(max_speed_change)
+                if applied_atempo < min_atempo:
+                    applied_atempo = min_atempo
+                elif applied_atempo > max_atempo:
+                    applied_atempo = max_atempo
+
+            delay_ms = int(round(float(seg.start_time) * 1000.0))
+            inputs.append((tts_res.output_path, applied_atempo, delay_ms, src_dur))
+
+        if not inputs:
+            raise RuntimeError("No successful TTS segments to compose dubbed audio")
+
+        total_duration = get_audio_duration_seconds(self.state.audio_path)
+        if total_duration is None:
+            total_duration = max(float(s.end_time) for s in segments) if segments else None
+
+        cmd: List[str] = ["ffmpeg", "-y"]
+        for path, _, _, _ in inputs:
+            cmd.extend(["-i", path])
+
+        filter_parts: List[str] = []
+        mix_labels: List[str] = []
+        for i, (_, atempo, delay_ms, slot_dur) in enumerate(inputs):
+            label = f"a{i}"
+            mix_labels.append(f"[{label}]")
+            # Force exact slot duration: time-scale (speaking rate), then pad/trim.
+            # `apad` extends with silence; `atrim` cuts/pads to exactly slot_dur.
+            atempo_filters = _atempo_chain(atempo)
+            filter_parts.append(
+                f"[{i}:a]{atempo_filters},apad,atrim=duration={float(slot_dur):.5f},adelay={delay_ms}|{delay_ms}[{label}]"
+            )
+
+        mix_in = "".join(mix_labels)
+        filter_parts.append(f"{mix_in}amix=inputs={len(inputs)}:normalize=0[aout]")
+        filter_complex = ";".join(filter_parts)
+
+        cmd.extend(["-filter_complex", filter_complex, "-map", "[aout]", "-ac", "1"])
+        if total_duration is not None:
+            cmd.extend(["-t", str(float(total_duration))])
+        cmd.append(out_audio_path)
+
+        self._run_ffmpeg(cmd)
+        return out_audio_path
+
+    def _mux_dubbed_video(
+        self,
+        input_video_path: str,
+        dubbed_audio_path: str,
+        out_video_path: str,
+    ) -> str:
+        """Mux dubbed audio with the original video stream."""
+        os.makedirs(os.path.dirname(out_video_path) or ".", exist_ok=True)
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            input_video_path,
+            "-i",
+            dubbed_audio_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            out_video_path,
+        ]
+        self._run_ffmpeg(cmd)
+        return out_video_path
     
     def _save_metadata(self, result: Dict) -> None:
         """Save complete pipeline execution metadata."""

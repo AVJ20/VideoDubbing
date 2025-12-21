@@ -15,7 +15,7 @@ Provides methods for:
 
 import logging
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Tuple
 from enum import Enum
 
 logger = logging.getLogger(__name__)
@@ -129,7 +129,12 @@ class SegmentAligner:
         Align a single segment and determine timing strategy.
         """
         source_duration = source_end - source_start
-        scaling_factor = target_duration / source_duration if source_duration > 0 else 1.0
+        raw_scaling_factor = (
+            target_duration / source_duration if source_duration > 0 else 1.0
+        )
+        # ffmpeg `atempo` factor that would make output_duration == source_duration
+        # given an input duration of `target_duration`.
+        required_atempo = raw_scaling_factor
         
         # Determine alignment status
         duration_diff = abs(target_duration - source_duration)
@@ -140,23 +145,24 @@ class SegmentAligner:
             target_end = source_end
             actual_scaling = 1.0
         elif self.strategy == AlignmentStrategy.STRICT:
-            # Force target to match source duration
-            status = "stretched" if target_duration > source_duration else "compressed"
+            # Force per-segment timing to match the source slot.
+            # Any duration mismatch should be resolved via speaking-rate/time-scaling.
+            status = "rate_adjusted"
             target_start = source_start
             target_end = source_end
-            actual_scaling = 1.0
+            actual_scaling = raw_scaling_factor
         elif self.strategy == AlignmentStrategy.FLEXIBLE:
             # Allow full duration change
             status = "stretched" if target_duration > source_duration else "compressed"
             target_start = source_start
             target_end = source_start + target_duration
-            actual_scaling = scaling_factor
+            actual_scaling = raw_scaling_factor
         else:  # ADAPTIVE
             # Preserve start time, adjust end time
             status = "modified"
             target_start = source_start
             target_end = source_start + target_duration
-            actual_scaling = scaling_factor
+            actual_scaling = raw_scaling_factor
         
         # Create timing map
         timing_map = TimingMap(
@@ -179,7 +185,9 @@ class SegmentAligner:
             metadata={
                 "source_duration": source_duration,
                 "target_duration": target_duration,
-                "scaling_factor": actual_scaling
+                "scaling_factor": actual_scaling,
+                "required_atempo": required_atempo,
+                "duration_diff": duration_diff,
             }
         )
         
