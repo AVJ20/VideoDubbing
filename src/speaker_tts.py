@@ -15,10 +15,13 @@ from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
 import time
-
-logger = logging.getLogger(__name__)
+import shutil
+import hashlib
+import json
 
 from .audio import get_audio_duration_seconds
+
+logger = logging.getLogger(__name__)
 
 
 class VoiceCloneMethod(Enum):
@@ -817,12 +820,47 @@ class SpeakerTTSOrchestrator:
             (list of TTSResult, dict with timing info)
         """
         os.makedirs(output_dir, exist_ok=True)
+
+        # Output-dir reuse (fast path): if this output_dir already contains
+        # synthesized audio for the same inputs, skip TTS entirely.
+        output_manifest_path = os.path.join(output_dir, "_tts_manifest.json")
+        try:
+            with open(output_manifest_path, "r", encoding="utf-8") as f:
+                output_manifest = json.load(f)
+            if not isinstance(output_manifest, dict):
+                output_manifest = {}
+        except Exception:
+            output_manifest = {}
+
+        # Persistent cache (reuses audio across runs when inputs are identical).
+        # output_dir is typically: <work>/<output_name>/segments
+        # We store cache at <work>/_cache so it persists across runs.
+        work_dir_guess = os.path.dirname(os.path.dirname(os.path.abspath(output_dir)))
+        cache_root = os.path.join(work_dir_guess, "_cache")
+        os.makedirs(cache_root, exist_ok=True)
+        cache_manifest_path = os.path.join(cache_root, "tts_cache.json")
+        try:
+            with open(cache_manifest_path, "r", encoding="utf-8") as f:
+                tts_cache = json.load(f)
+            if not isinstance(tts_cache, dict):
+                tts_cache = {}
+        except Exception:
+            tts_cache = {}
+
+        cache_audio_dir = os.path.join(cache_root, "tts_audio")
+        os.makedirs(cache_audio_dir, exist_ok=True)
+
+        cache_hits = 0
+        cache_misses = 0
+        cache_saved = 0
+        output_dir_hits = 0
         
         results = []
         timing_info = {
             "total_segments": len(segments),
             "successful": 0,
             "failed": 0,
+            "cached": 0,
             "total_duration": 0.0,
             "segment_durations": {}
         }
@@ -832,8 +870,6 @@ class SpeakerTTSOrchestrator:
         reference_dir = os.path.join(output_dir, "_refs")
         if use_segment_audio_as_reference and source_audio_path:
             os.makedirs(reference_dir, exist_ok=True)
-
-        source_audio_duration: Optional[float] = None
         if use_segment_audio_as_reference and source_audio_path and os.path.exists(source_audio_path):
             try:
                 from .audio import get_wav_duration_seconds
@@ -845,6 +881,29 @@ class SpeakerTTSOrchestrator:
         # Build all TTSSegment objects first (so worker backends can batch).
         tts_segments: List[TTSSegment] = []
         reference_seconds_total = 0.0
+        cache_key_by_segment_id: Dict[int, str] = {}
+
+        def _fingerprint(path: str) -> dict | None:
+            try:
+                st = os.stat(path)
+                return {
+                    "path": os.path.abspath(path),
+                    "size": int(st.st_size),
+                    "mtime_ns": int(
+                        getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
+                    ),
+                }
+            except Exception:
+                return None
+
+        def _stable_key(payload: dict) -> str:
+            raw = json.dumps(
+                payload,
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            return hashlib.sha256(raw).hexdigest()
 
         for seg in segments:
             segment_id = seg.get("id", 0)
@@ -864,18 +923,19 @@ class SpeakerTTSOrchestrator:
             
             # Create (optional) per-segment reference audio for zero-shot cloning.
             profile_for_segment = profile
+            reference_identity = None
             if profile.voice_reference and os.path.exists(profile.voice_reference):
                 # Prefer explicit per-speaker reference audio when provided.
                 profile_for_segment = replace(
                     profile,
                     clone_method=VoiceCloneMethod.ZERO_SHOT,
                 )
+                reference_identity = {
+                    "type": "speaker_reference",
+                    "file": _fingerprint(profile.voice_reference),
+                }
             elif use_segment_audio_as_reference and source_audio_path:
                 try:
-                    from .audio import extract_audio_clip, get_wav_duration_seconds
-
-                    ref_t0 = time.perf_counter()
-
                     seg_start = max(0.0, float(start_time))
                     seg_end = max(seg_start, float(end_time))
                     seg_len = seg_end - seg_start
@@ -908,17 +968,148 @@ class SpeakerTTSOrchestrator:
                             clip_end = source_audio_duration
                             clip_start = max(0.0, clip_end - desired_len)
 
+                    # Identity for caching (before doing any extraction work).
+                    reference_identity = {
+                        "type": "segment_reference",
+                        "source": _fingerprint(source_audio_path),
+                        "clip_start": float(clip_start),
+                        "clip_end": float(clip_end),
+                        "reference_min_seconds": float(reference_min_seconds),
+                        "reference_max_seconds": float(reference_max_seconds),
+                    }
+
                     ref_path = os.path.join(
                         reference_dir,
                         f"seg_{segment_id:04d}_{speaker_id}_ref.wav",
                     )
+                    # We will extract this reference only if we need to synth.
+                except Exception as e:
+                    logger.warning(
+                        "Could not extract reference audio for segment %s (%s): %s",
+                        segment_id,
+                        speaker_id,
+                        str(e),
+                    )
+
+            # Prepare output path for this segment.
+            output_path = os.path.join(
+                output_dir,
+                f"segment_{segment_id:04d}.wav",
+            )
+
+            # Cache key: skip TTS if identical text+voice conditioning.
+            tts_backend_sig = {
+                "backend": self.tts.__class__.__name__,
+                "language": language,
+            }
+            cache_key = _stable_key(
+                {
+                    "speaker_id": str(speaker_id),
+                    "text": str(text or ""),
+                    "tts_backend": tts_backend_sig,
+                    "reference": reference_identity,
+                }
+            )
+
+            # Reuse already-generated output in this folder when inputs match.
+            existing_output = output_manifest.get(str(int(segment_id)))
+            if (
+                os.path.exists(output_path)
+                and isinstance(existing_output, dict)
+                and existing_output.get("key") == cache_key
+            ):
+                dur = get_audio_duration_seconds(output_path)
+                result = TTSResult(
+                    segment_id=int(segment_id),
+                    speaker_id=str(speaker_id),
+                    success=True,
+                    output_path=output_path,
+                    duration=float(dur) if dur is not None else None,
+                    error=None,
+                    metadata={
+                        "cache": {
+                            "hit": True,
+                            "source": "output_dir",
+                            "key": cache_key,
+                        }
+                    },
+                )
+                results.append(result)
+                self.synthesis_results[int(segment_id)] = result
+                timing_info["successful"] += 1
+                timing_info["cached"] += 1
+                output_dir_hits += 1
+                cache_hits += 1
+                if result.duration is not None:
+                    timing_info["total_duration"] += float(result.duration)
+                    timing_info["segment_durations"][int(segment_id)] = float(
+                        result.duration
+                    )
+                continue
+
+            cached = tts_cache.get(cache_key)
+            cached_wav = None
+            if isinstance(cached, dict):
+                cached_wav = cached.get("cached_wav")
+
+            if cached_wav and os.path.exists(cached_wav):
+                # Reuse cached audio by copying into output_dir.
+                os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+                shutil.copyfile(cached_wav, output_path)
+                cache_hits += 1
+                dur = get_audio_duration_seconds(output_path)
+                result = TTSResult(
+                    segment_id=int(segment_id),
+                    speaker_id=str(speaker_id),
+                    success=True,
+                    output_path=output_path,
+                    duration=float(dur) if dur is not None else None,
+                    error=None,
+                    metadata={
+                        "cache": {
+                            "hit": True,
+                            "key": cache_key,
+                        }
+                    },
+                )
+                results.append(result)
+                self.synthesis_results[int(segment_id)] = result
+                timing_info["successful"] += 1
+                timing_info["cached"] += 1
+                if result.duration is not None:
+                    timing_info["total_duration"] += float(result.duration)
+                    timing_info["segment_durations"][int(segment_id)] = float(
+                        result.duration
+                    )
+                continue
+
+            cache_misses += 1
+
+            # If we intend to use per-segment audio references, extract them now
+            # (cache miss only).
+            if (
+                reference_identity
+                and reference_identity.get("type") == "segment_reference"
+                and use_segment_audio_as_reference
+                and source_audio_path
+            ):
+                try:
+                    from .audio import extract_audio_clip, get_wav_duration_seconds
+
+                    clip_start = float(reference_identity["clip_start"])
+                    clip_end = float(reference_identity["clip_end"])
+                    ref_path = os.path.join(
+                        reference_dir,
+                        f"seg_{segment_id:04d}_{speaker_id}_ref.wav",
+                    )
+
+                    ref_t0 = time.perf_counter()
                     extract_audio_clip(
                         source_audio_path,
                         ref_path,
                         clip_start,
                         clip_end,
                     )
-
                     reference_seconds_total += (time.perf_counter() - ref_t0)
 
                     ref_dur = get_wav_duration_seconds(ref_path)
@@ -941,7 +1132,6 @@ class SpeakerTTSOrchestrator:
                     )
 
             # Create TTS segment
-            output_path = os.path.join(output_dir, f"segment_{segment_id:04d}.wav")
             tts_seg = TTSSegment(
                 segment_id=segment_id,
                 text=text,
@@ -952,6 +1142,8 @@ class SpeakerTTSOrchestrator:
                 language=language,
                 output_path=output_path
             )
+
+            cache_key_by_segment_id[int(segment_id)] = cache_key
 
             tts_segments.append(tts_seg)
 
@@ -967,6 +1159,28 @@ class SpeakerTTSOrchestrator:
             segment_id = int(result.segment_id)
             results.append(result)
             self.synthesis_results[segment_id] = result
+
+            # Update cache on successful synth.
+            try:
+                if result.success and result.output_path and os.path.exists(result.output_path):
+                    # Copy into global cache store.
+                    cache_key = cache_key_by_segment_id.get(int(segment_id))
+                    if cache_key:
+                        cached_wav = os.path.join(cache_audio_dir, f"{cache_key}.wav")
+                        shutil.copyfile(result.output_path, cached_wav)
+                        tts_cache[cache_key] = {
+                            "cached_wav": cached_wav,
+                            "created_at": time.time(),
+                        }
+                        cache_saved += 1
+
+                        # Update output-dir manifest for next run.
+                        output_manifest[str(int(segment_id))] = {
+                            "key": cache_key,
+                            "updated_at": time.time(),
+                        }
+            except Exception:
+                pass
 
             if result.success:
                 if (
@@ -987,11 +1201,38 @@ class SpeakerTTSOrchestrator:
 
         timing_info["reference_extraction_seconds"] = reference_seconds_total
         timing_info["tts_synthesis_seconds"] = synth_seconds_total
+
+        # Persist cache.
+        try:
+            with open(cache_manifest_path, "w", encoding="utf-8") as f:
+                json.dump(tts_cache, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+        # Persist output-dir manifest.
+        try:
+            with open(output_manifest_path, "w", encoding="utf-8") as f:
+                json.dump(output_manifest, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
         
         logger.info(
-            f"Synthesis complete: {timing_info['successful']}/{timing_info['total_segments']} "
-            f"successful, total duration: {timing_info['total_duration']:.1f}s"
+            "Synthesis complete: %s/%s successful, cached=%s (hits=%s, misses=%s, saved=%s), total duration: %.1fs",
+            timing_info["successful"],
+            timing_info["total_segments"],
+            timing_info["cached"],
+            cache_hits,
+            cache_misses,
+            cache_saved,
+            float(timing_info["total_duration"]),
         )
+
+        if output_dir_hits:
+            logger.info(
+                "TTS reuse: output_dir hits=%s (manifest=%s)",
+                output_dir_hits,
+                output_manifest_path,
+            )
         
         return results, timing_info
     

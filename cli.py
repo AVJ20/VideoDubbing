@@ -84,6 +84,15 @@ def main():
         ),
     )
 
+    parser.add_argument(
+        "--metrics",
+        action="store_true",
+        help=(
+            "Compute evaluation metrics (isochrony, speech rate) and write to "
+            "<output_dir>/metrics/ (enhanced pipeline only)."
+        ),
+    )
+
     args = parser.parse_args()
     
     # Validate that either --url or --file is provided
@@ -122,7 +131,8 @@ def main():
                 work_dir=args.work_dir,
                 output_dir=output_dir,
                 tts_device=args.tts_device,
-                debug=False
+                debug=False,
+                compute_metrics=bool(args.metrics),
             )
             if args.multi_env:
                 # Run TTS per segment in the separate `tts` environment.

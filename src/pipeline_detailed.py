@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple
 import json
 import subprocess
+import sys
 from datetime import datetime, timezone
 
 from .audio import extract_audio, get_audio_duration_seconds
@@ -36,7 +37,13 @@ from .speaker_tts import (
     ElevenLabsSpeakerTTS,
     create_speaker_profiles_from_segments
 )
-from .translator import AbstractTranslator, GroqTranslator
+from .translator import (
+    AbstractTranslator,
+    GroqTranslator,
+    OpenAITranslator,
+    AzureOpenAITranslator,
+)
+from .cache import ensure_dir, load_json, save_json_atomic, stable_hash_dict
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +71,9 @@ class DetailedPipelineConfig:
     
     # Pipeline
     debug: bool = False
+
+    # Metrics
+    compute_metrics: bool = False
 
 
 @dataclass
@@ -140,7 +150,23 @@ class DetailedDubbingPipeline:
         else:
             self.asr = asr
         
-        self.translator = translator or GroqTranslator()
+        if translator is not None:
+            self.translator = translator
+        else:
+            if (
+                os.environ.get("AZURE_OPENAI_API_KEY")
+                and os.environ.get("AZURE_OPENAI_ENDPOINT")
+                and os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+            ):
+                self.translator = AzureOpenAITranslator()
+            elif os.environ.get("OPENAI_API_KEY"):
+                model = (
+                    os.environ.get("OPENAI_TRANSLATION_MODEL")
+                    or "gpt-4o-mini"
+                )
+                self.translator = OpenAITranslator(model=model)
+            else:
+                self.translator = GroqTranslator()
         
         if tts is None:
             # Use Chatterbox TTS (free, open-source API)
@@ -299,6 +325,38 @@ class DetailedDubbingPipeline:
                 alignment_results
             )
             result["stages"]["output"] = output_info
+
+            # Stage 9: Metrics (optional)
+            if getattr(self.config, "compute_metrics", False):
+                self.state.stage = "metrics"
+                try:
+                    from .metrics.runner import compute_dubbing_metrics
+
+                    dubbed_audio_path = (output_info or {}).get("dubbed_audio")
+                    if dubbed_audio_path and os.path.exists(dubbed_audio_path):
+                        metrics_info = compute_dubbing_metrics(
+                            source_audio_path=self.state.audio_path,
+                            dubbed_audio_path=dubbed_audio_path,
+                            segments=segmentation_result.segments,
+                            translated_segments=translated_segments,
+                            output_dir=self.config.output_dir,
+                        )
+                        result["stages"]["metrics"] = metrics_info
+                    else:
+                        result["stages"]["metrics"] = {
+                            "status": "skipped",
+                            "reason": (
+                                "Dubbed audio missing; cannot compute metrics"
+                            ),
+                        }
+                except Exception as e:
+                    logger.warning(
+                        "Failed to compute metrics: %s", str(e), exc_info=True
+                    )
+                    result["stages"]["metrics"] = {
+                        "status": "failed",
+                        "error": str(e),
+                    }
             
             # Success
             self.state.stage = "complete"
@@ -522,6 +580,62 @@ class DetailedDubbingPipeline:
                            target_lang: str) -> List[dict]:
         """Translate segment text while preserving speaker metadata."""
         logger.info(f"Translating {len(segments)} segments ({source_lang} -> {target_lang})")
+
+        # Output-dir reuse: if this output already has translations for the
+        # *same* segmentation (by segment id + original_text), reuse them.
+        translated_path = os.path.join(self.config.output_dir, "translated_segments.json")
+        try:
+            if os.path.exists(translated_path):
+                existing = load_json(translated_path, default=None)
+                if isinstance(existing, list) and existing:
+                    by_id = {
+                        int(e.get("id")): e
+                        for e in existing
+                        if isinstance(e, dict) and e.get("id") is not None
+                    }
+
+                    matches = True
+                    for seg in segments:
+                        cur_id = int(seg.id)
+                        cur_src = (seg.text or "").strip()
+                        prev = by_id.get(cur_id)
+                        if not isinstance(prev, dict):
+                            matches = False
+                            break
+                        prev_src = (prev.get("original_text") or "").strip()
+                        if prev_src != cur_src:
+                            matches = False
+                            break
+
+                    if matches:
+                        logger.info(
+                            "Reusing translations from output dir: %s",
+                            translated_path,
+                        )
+                        return existing
+        except Exception as e:
+            logger.warning(
+                "Could not reuse output-dir translations (%s): %s",
+                translated_path,
+                str(e),
+            )
+
+        # Persistent cache to avoid repeated paid translation calls.
+        cache_root = os.path.join(self.config.work_dir, "_cache")
+        ensure_dir(cache_root)
+        cache_path = os.path.join(cache_root, "translation_cache.json")
+        cache = load_json(cache_path, default={})
+        if not isinstance(cache, dict):
+            cache = {}
+
+        translator_sig = {
+            "class": self.translator.__class__.__name__,
+            "model": getattr(self.translator, "model", None),
+            "deployment": getattr(self.translator, "deployment_name", None),
+        }
+
+        cache_hits = 0
+        cache_misses = 0
         
         translated = []
         for idx, seg in enumerate(segments):
@@ -531,22 +645,64 @@ class DetailedDubbingPipeline:
             previous_segments = [s.text for s in segments[prev_start:idx]]
             next_segments = [s.text for s in segments[idx + 1:next_end]]
 
-            if hasattr(self.translator, "translate_with_context"):
-                translated_text = self.translator.translate_with_context(
-                    seg.text,
-                    source_lang,
-                    target_lang,
-                    previous_segments=previous_segments,
-                    next_segments=next_segments,
-                )
+            cache_key = stable_hash_dict(
+                {
+                    "source_lang": source_lang,
+                    "target_lang": target_lang,
+                    "text": seg.text or "",
+                    # Note: we intentionally do NOT include context here
+                    # so identical segment text reuses a prior translation.
+                    "translator": translator_sig,
+                }
+            )
+
+            cached_item = cache.get(cache_key)
+            if isinstance(cached_item, dict) and cached_item.get("text"):
+                translated_text = str(cached_item.get("text") or "").strip()
+                translation_meta = cached_item
+                cache_hits += 1
             else:
-                translated_text = self.translator.translate(
-                    seg.text,
-                    source_lang,
-                    target_lang,
-                )
+                cache_misses += 1
+                translation_meta = None
+                if hasattr(self.translator, "translate_with_context_and_quality"):
+                    translation_meta = (
+                        self.translator.translate_with_context_and_quality(
+                            seg.text,
+                            source_lang,
+                            target_lang,
+                            previous_segments=previous_segments,
+                            next_segments=next_segments,
+                        )
+                        or {}
+                    )
+                    translated_text = (
+                        str(translation_meta.get("text") or "").strip()
+                    )
+                elif hasattr(self.translator, "translate_with_context"):
+                    translated_text = self.translator.translate_with_context(
+                        seg.text,
+                        source_lang,
+                        target_lang,
+                        previous_segments=previous_segments,
+                        next_segments=next_segments,
+                    )
+                else:
+                    translated_text = self.translator.translate(
+                        seg.text,
+                        source_lang,
+                        target_lang,
+                    )
+
+                # Store best-effort metadata (including quality if present).
+                if translation_meta is None:
+                    translation_meta = {"text": translated_text}
+                cache[cache_key] = translation_meta
+
+            # Flush cache periodically to keep runs resilient.
+            if (idx % 10) == 0:
+                save_json_atomic(cache_path, cache)
             
-            translated.append({
+            item = {
                 "id": seg.id,
                 "text": translated_text,
                 "speaker": seg.speaker,
@@ -555,9 +711,28 @@ class DetailedDubbingPipeline:
                 "original_text": seg.text,
                 "duration": seg.duration,
                 "confidence": seg.confidence
-            })
-        
-        logger.info(f"Translation complete")
+            }
+            if translation_meta:
+                if translation_meta.get("register"):
+                    item["translation_register"] = translation_meta.get("register")
+                if translation_meta.get("localization_notes"):
+                    item["translation_localization_notes"] = translation_meta.get(
+                        "localization_notes"
+                    )
+                if translation_meta.get("translation_quality"):
+                    item["translation_quality"] = translation_meta.get(
+                        "translation_quality"
+                    )
+            translated.append(item)
+
+        save_json_atomic(cache_path, cache)
+
+        logger.info(
+            "Translation complete (cache hits=%s, misses=%s, cache=%s)",
+            cache_hits,
+            cache_misses,
+            cache_path,
+        )
         return translated
     
     def _synthesize_dubbed_audio(self,
@@ -652,6 +827,20 @@ class DetailedDubbingPipeline:
                 out_audio_path=dubbed_audio_path,
                 max_speed_change=None,
             )
+
+            # Preserve background ambience: mix a ducked version of the original
+            # audio under the dubbed track.
+            try:
+                self._mix_background_ambience(
+                    dubbed_audio_path=dubbed_audio_path,
+                    background_audio_path=self.state.audio_path,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Background ambience mix failed; continuing without it: %s",
+                    str(e),
+                )
+
             self._mux_dubbed_video(
                 input_video_path=self.state.video_path,
                 dubbed_audio_path=dubbed_audio_path,
@@ -824,6 +1013,145 @@ class DetailedDubbingPipeline:
         ]
         self._run_ffmpeg(cmd)
         return out_video_path
+
+    def _mix_background_ambience(
+        self,
+        dubbed_audio_path: str,
+        background_audio_path: str,
+    ) -> str:
+        """Mix background ambience from the original audio under the dubbed track.
+
+        This uses sidechain compression so when the dubbed voice is present, the
+        original audio is strongly attenuated (reducing source speech bleed) while
+        still preserving room tone / ambience.
+        """
+
+        if not (dubbed_audio_path and os.path.exists(dubbed_audio_path)):
+            raise RuntimeError("Dubbed audio not found")
+        if not (background_audio_path and os.path.exists(background_audio_path)):
+            raise RuntimeError("Background audio not found")
+
+        use_demucs = str(
+            os.environ.get("DEMUCS_BACKGROUND", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
+        background_bed_path = background_audio_path
+        if use_demucs:
+            try:
+                background_bed_path = self._extract_background_bed_demucs(
+                    background_audio_path
+                )
+                logger.info(
+                    "Using Demucs background bed: %s",
+                    background_bed_path,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Demucs background extraction failed; falling back to "
+                    "ducked-original mix: %s",
+                    str(e),
+                )
+                background_bed_path = background_audio_path
+
+        tmp_out = dubbed_audio_path + ".tmp.wav"
+
+        # Filtergraph notes:
+        # - Use the original audio as a background bed.
+        # - Duck it using the dubbed audio as the sidechain.
+        # - Mix the ducked bed under the dubbed track.
+        filter_complex = (
+            "[1:a]highpass=f=60,lowpass=f=8000[bg];"
+            "[bg][0:a]sidechaincompress=threshold=0.02:ratio=20:attack=20:release=250[bgduck];"
+            "[bgduck]volume=0.25[bgv];"
+            "[0:a][bgv]amix=inputs=2:normalize=0[aout]"
+        )
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            dubbed_audio_path,
+            "-i",
+            background_bed_path,
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[aout]",
+            "-ac",
+            "1",
+            tmp_out,
+        ]
+
+        self._run_ffmpeg(cmd)
+        os.replace(tmp_out, dubbed_audio_path)
+        return dubbed_audio_path
+
+    def _extract_background_bed_demucs(self, audio_path: str) -> str:
+        """Extract a background-only bed using Demucs.
+
+        Produces a `no_vocals.wav` track using `--two-stems vocals`.
+        This is much better than sidechain ducking for removing source speech.
+        """
+
+        if not (audio_path and os.path.exists(audio_path)):
+            raise RuntimeError("audio not found for demucs")
+
+        # Use the current interpreter so Demucs is resolved in this env.
+        py = sys.executable
+
+        out_root = os.path.join(self.config.output_dir, "segments", "_demucs")
+        os.makedirs(out_root, exist_ok=True)
+
+        model = os.environ.get("DEMUCS_MODEL") or "htdemucs"
+        device = os.environ.get("DEMUCS_DEVICE")  # e.g. "cpu" or "cuda"
+
+        # Demucs output layout:
+        #   <out_root>/separated/<model>/<basename>/no_vocals.wav
+        # Depending on version, it may create <out_root>/<model>/<basename>/.
+        # We'll search for the expected file.
+        cmd: List[str] = [
+            py,
+            "-m",
+            "demucs.separate",
+            "--two-stems",
+            "vocals",
+            "-n",
+            model,
+            "-o",
+            out_root,
+            audio_path,
+        ]
+        if device:
+            cmd.extend(["-d", device])
+
+        logger.info("Running Demucs to extract background bed")
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if proc.returncode != 0:
+            stderr = (proc.stderr or proc.stdout or "").strip()
+            raise RuntimeError(f"demucs failed: {stderr}")
+
+        base = os.path.splitext(os.path.basename(audio_path))[0]
+        candidates = [
+            os.path.join(out_root, "separated", model, base, "no_vocals.wav"),
+            os.path.join(out_root, model, base, "no_vocals.wav"),
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+
+        # Last resort: search in out_root for no_vocals.wav
+        for root, _, files in os.walk(out_root):
+            for fn in files:
+                if fn.lower() == "no_vocals.wav":
+                    return os.path.join(root, fn)
+
+        raise RuntimeError("demucs output no_vocals.wav not found")
     
     def _save_metadata(self, result: Dict) -> None:
         """Save complete pipeline execution metadata."""

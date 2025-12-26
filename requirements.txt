@@ -3,6 +3,13 @@ pydub>=0.25.1
 ffmpeg-python>=0.3.0
 requests>=2.31.0
 
+# Metrics/utils
+numpy<2
+
+# Optional: background separation for ambience mixing
+demucs>=4.0.0
+
+
 # Translation backends - choose at least one
 openai>=1.0.0           # Paid option
 groq>=0.4.0             # Free option (recommended)

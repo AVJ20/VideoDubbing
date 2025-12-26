@@ -14,7 +14,12 @@ from typing import Optional
 
 from .downloader import VideoDownloader
 from .audio import extract_audio
-from .translator import AbstractTranslator, GroqTranslator
+from .translator import (
+    AbstractTranslator,
+    GroqTranslator,
+    OpenAITranslator,
+    AzureOpenAITranslator,
+)
 from workers.env_manager import EnvManager
 
 logger = logging.getLogger(__name__)
@@ -38,7 +43,23 @@ class EnvAwarePipeline:
         config: PipelineConfig = PipelineConfig(),
     ):
         self.downloader = VideoDownloader()
-        self.translator = translator or GroqTranslator()
+        if translator is not None:
+            self.translator = translator
+        else:
+            if (
+                os.environ.get("AZURE_OPENAI_API_KEY")
+                and os.environ.get("AZURE_OPENAI_ENDPOINT")
+                and os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+            ):
+                self.translator = AzureOpenAITranslator()
+            elif os.environ.get("OPENAI_API_KEY"):
+                model = (
+                    os.environ.get("OPENAI_TRANSLATION_MODEL")
+                    or "gpt-4o-mini"
+                )
+                self.translator = OpenAITranslator(model=model)
+            else:
+                self.translator = GroqTranslator()
         self.config = config
         os.makedirs(self.config.work_dir, exist_ok=True)
         

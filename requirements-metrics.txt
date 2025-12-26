@@ -1,0 +1,23 @@
+# Metrics-only environment requirements
+# Install in a dedicated env (recommended):
+#   conda create -n metrics python=3.10 -y
+#   conda activate metrics
+#   cd C:\Codebase\VD\VideoDubbing
+#   pip install -r requirements-metrics.txt
+#
+# Notes:
+# - This env is intended to run evaluation metrics only.
+# - Speaker similarity uses SpeechBrain ECAPA embeddings (free model download).
+# - Prosody metrics use ffmpeg + numpy (no paid API).
+
+numpy<2
+
+# SpeechBrain speaker verification
+speechbrain>=1.0.0
+
+# Runtime dependencies (CPU)
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# Model download utils (commonly used by SpeechBrain)
+huggingface-hub>=0.16.0

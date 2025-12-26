@@ -5,8 +5,10 @@ import time
 import random
 import collections
 import threading
+import json
+from dataclasses import dataclass
 from abc import ABC, abstractmethod
-from typing import Optional, Sequence, Literal
+from typing import Optional, Sequence, Literal, Any
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +243,67 @@ def build_context_aware_translation_prompt(
     )
 
 
+@dataclass
+class TranslationQuality:
+    status: str
+    score: float | None = None
+    summary: str | None = None
+    issues: list[str] | None = None
+    model: str | None = None
+
+
+def _extract_first_json_object(text: str) -> dict:
+    """Best-effort extraction of a JSON object from model output."""
+
+    t = (text or "").strip()
+    if not t:
+        raise ValueError("empty response")
+
+    if t.startswith("{") and t.endswith("}"):
+        return json.loads(t)
+
+    start = t.find("{")
+    end = t.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("no JSON object found")
+    return json.loads(t[start:end + 1])
+
+
+def _clamp01(v: Any) -> float | None:
+    try:
+        x = float(v)
+    except Exception:
+        return None
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    return x
+
+
+def _normalize_register(v: Any) -> str:
+    s = str(v or "").strip().lower()
+    if s in {"formal", "colloquial", "neutral", "casual"}:
+        return "colloquial" if s == "casual" else s
+    return "neutral"
+
+
+def _openai_retry_sleep_seconds(attempt: int) -> float:
+    return min(10.0, (2.0 ** attempt) * 0.8)
+
+
+def _normalize_azure_endpoint(endpoint: str) -> str:
+    e = (endpoint or "").strip()
+    if len(e) >= 2 and e[0] == e[-1] and e[0] in {'"', "'"}:
+        e = e[1:-1].strip()
+    # Users often paste full REST base paths; SDK expects resource root.
+    for suffix in ("/openai/v1/", "/openai/v1", "/openai/", "/openai"):
+        if e.lower().endswith(suffix):
+            e = e[: -len(suffix)]
+            break
+    return e.rstrip("/")
+
+
 class OpenAITranslator(AbstractTranslator):
     """Translate text using OpenAI chat completion API.
 
@@ -313,29 +376,172 @@ class OpenAITranslator(AbstractTranslator):
         next_segments: Optional[Sequence[str]] = None,
         register_hint: Optional[str] = None,
     ) -> str:
-        register = infer_register_from_asr(text)
+        # If a register is explicitly requested, keep the existing prompt path.
         if register_hint in {"colloquial", "formal", "neutral"}:
-            register = register_hint  # type: ignore[assignment]
+            prompt = build_context_aware_translation_prompt(
+                source_language=source_language,
+                target_language=target_language,
+                current_text=text,
+                previous_segments=list(previous_segments or []),
+                next_segments=list(next_segments or []),
+                register=register_hint,  # type: ignore[arg-type]
+            )
 
-        prompt = build_context_aware_translation_prompt(
+            logger.info(
+                "Sending context-aware translation request to OpenAI model %s",
+                self.model,
+            )
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=2000,
+            )
+            return resp.choices[0].message.content.strip()
+
+        out = self.translate_with_context_and_quality(
+            text=text,
             source_language=source_language,
             target_language=target_language,
-            current_text=text,
-            previous_segments=list(previous_segments or []),
-            next_segments=list(next_segments or []),
-            register=register,
+            previous_segments=previous_segments,
+            next_segments=next_segments,
+        )
+        return (out.get("text") or "").strip()
+
+    def translate_with_context_and_quality(
+        self,
+        text: str,
+        source_language: str,
+        target_language: str,
+        previous_segments: Optional[Sequence[str]] = None,
+        next_segments: Optional[Sequence[str]] = None,
+    ) -> dict:
+        """Translate + auto-localize + infer register + score quality.
+
+        The quality score is a best-effort self-evaluation to help triage.
+        """
+
+        prev_block = (
+            "\n".join(f"- {t}" for t in (previous_segments or []))
+            if previous_segments
+            else "(none)"
+        )
+        next_block = (
+            "\n".join(f"- {t}" for t in (next_segments or []))
+            if next_segments
+            else "(none)"
         )
 
-        logger.info(
-            "Sending context-aware translation request to OpenAI model %s",
-            self.model,
+        system = (
+            "You are a professional audiovisual translator and localizer. "
+            "Translate dialogue for dubbing. Preserve meaning, "
+            "named entities, "
+            "and numbers. "
+            "Keep it natural, timing-friendly, and consistent with the "
+            "speaker's tone. "
+            "Automatically choose the best register in the TARGET language "
+            "(formal/colloquial/neutral) based on the CURRENT segment and "
+            "surrounding context. "
+            "Localize naturally for the target language (idioms/phrasing) "
+            "without adding new facts. "
+            "Return strict JSON only."
         )
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=2000,
+
+        user = (
+            f"SOURCE_LANGUAGE: {source_language}\n"
+            f"TARGET_LANGUAGE: {target_language}\n\n"
+            "PREVIOUS (context only, do not translate):\n"
+            f"{prev_block}\n\n"
+            "CURRENT (translate this only):\n"
+            f"{text}\n\n"
+            "NEXT (context only, do not translate):\n"
+            f"{next_block}\n\n"
+            "Output JSON:\n"
+            "{\n"
+            "  \"translation\": string,\n"
+            "  \"register\": \"formal\"|\"colloquial\"|\"neutral\",\n"
+            "  \"localization_notes\": string,\n"
+            "  \"quality\": {\n"
+            "    \"score\": number between 0 and 1,\n"
+            "    \"summary\": string,\n"
+            "    \"issues\": [string]\n"
+            "  }\n"
+            "}"
         )
-        return resp.choices[0].message.content.strip()
+
+        last_err: Exception | None = None
+        for attempt in range(5):
+            try:
+                kwargs = {
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "max_tokens": 2000,
+                }
+                # Ask for strict JSON where supported.
+                kwargs["response_format"] = {"type": "json_object"}
+
+                resp = self.client.chat.completions.create(**kwargs)
+                content = (resp.choices[0].message.content or "").strip()
+                obj = _extract_first_json_object(content)
+
+                translation = str(obj.get("translation") or "").strip()
+                register = _normalize_register(obj.get("register"))
+                localization_notes = (
+                    str(obj.get("localization_notes") or "").strip() or None
+                )
+
+                q = (
+                    obj.get("quality")
+                    if isinstance(obj.get("quality"), dict)
+                    else {}
+                )
+                score = _clamp01(q.get("score"))
+                summary = str(q.get("summary") or "").strip() or None
+                raw_issues = q.get("issues")
+                issues = (
+                    [str(i).strip() for i in raw_issues if str(i).strip()]
+                    if isinstance(raw_issues, list)
+                    else None
+                )
+
+                tq = TranslationQuality(
+                    status="ok" if translation else "failed",
+                    score=score,
+                    summary=summary,
+                    issues=issues,
+                    model=self.model,
+                )
+
+                return {
+                    "text": translation,
+                    "register": register,
+                    "localization_notes": localization_notes,
+                    "translation_quality": {
+                        "status": tq.status,
+                        "score": tq.score,
+                        "summary": tq.summary,
+                        "issues": tq.issues,
+                        "model": tq.model,
+                    },
+                }
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                if "429" in msg or "rate" in msg.lower():
+                    sleep_s = _openai_retry_sleep_seconds(attempt)
+                    logger.warning(
+                        "OpenAI rate-limited; sleeping %.2fs",
+                        sleep_s,
+                    )
+                    time.sleep(sleep_s)
+                    continue
+                break
+
+        raise RuntimeError(
+            f"OpenAI translate_with_context_and_quality failed: {last_err}"
+        )
 
 
 class AzureOpenAITranslator(AbstractTranslator):
@@ -368,6 +574,7 @@ class AzureOpenAITranslator(AbstractTranslator):
         self.endpoint = (
             endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT")
         )
+        self.endpoint = _normalize_azure_endpoint(self.endpoint)
         self.deployment_name = (
             deployment_name
             or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
@@ -393,7 +600,9 @@ class AzureOpenAITranslator(AbstractTranslator):
                 "deployment_name parameter."
             )
 
-        self.api_version = api_version
+        self.api_version = (
+            os.environ.get("AZURE_OPENAI_API_VERSION") or api_version
+        )
         self.client = AzureOpenAI(
             api_key=self.api_key,
             api_version=self.api_version,
@@ -437,29 +646,174 @@ class AzureOpenAITranslator(AbstractTranslator):
         next_segments: Optional[Sequence[str]] = None,
         register_hint: Optional[str] = None,
     ) -> str:
-        register = infer_register_from_asr(text)
+        # If a register is explicitly requested, keep the existing prompt path.
         if register_hint in {"colloquial", "formal", "neutral"}:
-            register = register_hint  # type: ignore[assignment]
+            prompt = build_context_aware_translation_prompt(
+                source_language=source_language,
+                target_language=target_language,
+                current_text=text,
+                previous_segments=list(previous_segments or []),
+                next_segments=list(next_segments or []),
+                register=register_hint,  # type: ignore[arg-type]
+            )
 
-        prompt = build_context_aware_translation_prompt(
+            logger.info(
+                "Sending context-aware translation to Azure OpenAI "
+                "deployment %s",
+                self.deployment_name,
+            )
+            resp = self.client.chat.completions.create(
+                model=self.deployment_name,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=2000,
+            )
+            return resp.choices[0].message.content.strip()
+
+        out = self.translate_with_context_and_quality(
+            text=text,
             source_language=source_language,
             target_language=target_language,
-            current_text=text,
-            previous_segments=list(previous_segments or []),
-            next_segments=list(next_segments or []),
-            register=register,
+            previous_segments=previous_segments,
+            next_segments=next_segments,
+        )
+        return (out.get("text") or "").strip()
+
+    def translate_with_context_and_quality(
+        self,
+        text: str,
+        source_language: str,
+        target_language: str,
+        previous_segments: Optional[Sequence[str]] = None,
+        next_segments: Optional[Sequence[str]] = None,
+    ) -> dict:
+        """Translate + auto-localize + infer register + score quality.
+
+        The quality score is a best-effort self-evaluation to help triage.
+        """
+
+        prev_block = (
+            "\n".join(f"- {t}" for t in (previous_segments or []))
+            if previous_segments
+            else "(none)"
+        )
+        next_block = (
+            "\n".join(f"- {t}" for t in (next_segments or []))
+            if next_segments
+            else "(none)"
         )
 
-        logger.info(
-            "Sending context-aware translation to Azure OpenAI deployment %s",
-            self.deployment_name,
+        system = (
+            "You are a professional audiovisual translator and localizer. "
+            "Translate dialogue for dubbing. Preserve meaning, "
+            "named entities, "
+            "and numbers. "
+            "Keep it natural, timing-friendly, and consistent with the "
+            "speaker's tone. "
+            "Automatically choose the best register in the TARGET language "
+            "(formal/colloquial/neutral) based on the CURRENT segment and "
+            "surrounding context. "
+            "Localize naturally for the target language (idioms/phrasing) "
+            "without adding new facts. "
+            "Return strict JSON only."
         )
-        resp = self.client.chat.completions.create(
-            model=self.deployment_name,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=2000,
+
+        user = (
+            f"SOURCE_LANGUAGE: {source_language}\n"
+            f"TARGET_LANGUAGE: {target_language}\n\n"
+            "PREVIOUS (context only, do not translate):\n"
+            f"{prev_block}\n\n"
+            "CURRENT (translate this only):\n"
+            f"{text}\n\n"
+            "NEXT (context only, do not translate):\n"
+            f"{next_block}\n\n"
+            "Output JSON:\n"
+            "{\n"
+            "  \"translation\": string,\n"
+            "  \"register\": \"formal\"|\"colloquial\"|\"neutral\",\n"
+            "  \"localization_notes\": string,\n"
+            "  \"quality\": {\n"
+            "    \"score\": number between 0 and 1,\n"
+            "    \"summary\": string,\n"
+            "    \"issues\": [string]\n"
+            "  }\n"
+            "}"
         )
-        return resp.choices[0].message.content.strip()
+
+        last_err: Exception | None = None
+        for attempt in range(5):
+            try:
+                kwargs = {
+                    "model": self.deployment_name,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "max_completion_tokens": 2000,
+                }
+                # Ask for strict JSON where supported.
+                kwargs["response_format"] = {"type": "json_object"}
+
+                resp = self.client.chat.completions.create(**kwargs)
+                content = (resp.choices[0].message.content or "").strip()
+                obj = _extract_first_json_object(content)
+
+                translation = str(obj.get("translation") or "").strip()
+                register = _normalize_register(obj.get("register"))
+                localization_notes = (
+                    str(obj.get("localization_notes") or "").strip() or None
+                )
+
+                q = (
+                    obj.get("quality")
+                    if isinstance(obj.get("quality"), dict)
+                    else {}
+                )
+                score = _clamp01(q.get("score"))
+                summary = str(q.get("summary") or "").strip() or None
+                raw_issues = q.get("issues")
+                issues = (
+                    [str(i).strip() for i in raw_issues if str(i).strip()]
+                    if isinstance(raw_issues, list)
+                    else None
+                )
+
+                tq = TranslationQuality(
+                    status="ok" if translation else "failed",
+                    score=score,
+                    summary=summary,
+                    issues=issues,
+                    model=self.deployment_name,
+                )
+
+                return {
+                    "text": translation,
+                    "register": register,
+                    "localization_notes": localization_notes,
+                    "translation_quality": {
+                        "status": tq.status,
+                        "score": tq.score,
+                        "summary": tq.summary,
+                        "issues": tq.issues,
+                        "model": tq.model,
+                    },
+                }
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                if "429" in msg or "rate" in msg.lower():
+                    sleep_s = _openai_retry_sleep_seconds(attempt)
+                    logger.warning(
+                        "Azure OpenAI rate-limited; sleeping %.2fs",
+                        sleep_s,
+                    )
+                    time.sleep(sleep_s)
+                    continue
+                break
+
+        raise RuntimeError(
+            "Azure OpenAI translate_with_context_and_quality failed: "
+            f"{last_err}"
+        )
 
 
 class GroqTranslator(AbstractTranslator):
@@ -563,7 +917,7 @@ class GroqTranslator(AbstractTranslator):
                 resp = self.client.chat.completions.create(
                     model=self.model,
                     messages=[{"role": "user", "content": prompt}],
-                    max_tokens=2000,
+                    max_completion_tokens=2000,
                 )
                 return resp.choices[0].message.content.strip()
             except Exception as e:
